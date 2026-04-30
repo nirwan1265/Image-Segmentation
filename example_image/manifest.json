@@ -1,0 +1,321 @@
+{
+  "examples": [
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A10_D10.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A12_D12.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A13_D13.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A14_D14.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A14_D14_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A15_D15.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A15_D15_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A15_D15_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A16_D16.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A16_D16_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A16_D16_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A17_D17.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A17_D17_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A17_D17_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A1_D1.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A1_D1_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A1_D1_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A2_D2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A3_D3.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A4_D4.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A4_D4_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A4_D4_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A5_D5.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A5_D5_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A5_D5_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A6_D6.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A6_D6_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A6_D6_2.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A6_D6_2_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A6_D6_3.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A7_D7.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A7_D7_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A7_D7_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A8_D8.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A8_D8_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A8_D8_2.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/A8_D8_2_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A8_D8_3.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/A9_D9.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E10_H10.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E10_H10_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E10_H10_2.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E10_H10_2_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E10_H10_3.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E10_H10_3_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E10_H10_4.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E11_H11.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E11_H11_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E11_H11_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E12_H12.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E13_H13.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E14_H14.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E14_H14_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E14_H14_2.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E14_H14_2_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E14_H14_3.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E14_H14_3_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E14_H14_4.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E15_H15.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E16_H16.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E17_H17.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E17_H17_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E1_H1.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E1_H1_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E1_H1_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E2_H2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E3_H3.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E3_H3_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E3_H3_2.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E3_H3_2_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E3_H3_3.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E4_H4.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E4_H4_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E4_H4_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E5_H5.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E5_H5_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E5_H5_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E6_H6.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E7_H7.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E8_H8.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E8_H8_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E8_H8_2.png",
+      "masks": [],
+      "no_target": true
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E9_H9.png",
+      "masks": [
+        "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/masks/E9_H9_inst01.png"
+      ]
+    },
+    {
+      "image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/example_image/images/E9_H9_2.png",
+      "masks": [],
+      "no_target": true
+    }
+  ]
+}

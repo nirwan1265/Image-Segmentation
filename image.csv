@@ -1,0 +1,2 @@
+FileName,Segment,area_px2,length_major_px,length_bbox_px,deskew_angle_deg,axis_height_px,width_minor_px,width_row_max_px,width_row_p95_px,axis_width_px,mean_R,mean_G,mean_B,median_R,median_G,median_B,sum_R,sum_G,sum_B,std_R,std_G,std_B
+ara2012_plant003_rgb,ara2012_plant003_rgb_1,2826,114.76,82.0,-42.23,82,47.56,49.0,48.0,88,98.485,155.397,23.278,99.0,164.0,21.0,278318.0,439152.0,65785.0,16.23,26.65,21.273

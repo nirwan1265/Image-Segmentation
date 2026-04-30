@@ -1,0 +1,4 @@
+mask_idx,area_px,bbox,mask_png,crop_png
+1,7774995,"[29, 0, 3341, 2539]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_1.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_crop_1.png
+2,116418,"[1650, 341, 915, 1327]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_2.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_crop_2.png
+3,79396,"[1549, 492, 429, 1119]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_3.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/E14_H14/E14_H14_crop_3.png

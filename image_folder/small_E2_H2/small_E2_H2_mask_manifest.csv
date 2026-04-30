@@ -1,0 +1,6 @@
+mask_idx,area_px,bbox,mask_png,crop_png
+1,363388,"[0, 0, 691, 577]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_1.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_crop_1.png
+2,7751,"[602, 6, 77, 321]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_2.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_crop_2.png
+3,6213,"[414, 94, 59, 212]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_3.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_crop_3.png
+4,5173,"[183, 105, 75, 239]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_4.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_crop_4.png
+5,3829,"[22, 118, 37, 197]",/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_5.png,/Users/nirwantandukar/Documents/Github/Image-Segmentation/image_folder/small_E2_H2/small_E2_H2_crop_5.png
