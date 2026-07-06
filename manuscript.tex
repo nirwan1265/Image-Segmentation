@@ -51,25 +51,7 @@ Model~2}}
 
 %% ── Abstract ──────────────────────────────────────────────────────────────────
 \begin{abstract}
-Accurate segmentation of plant structures in field and greenhouse imagery is a
-prerequisite for high-throughput, automated phenotyping.  Existing tools either
-demand substantial computational resources, require command-line expertise, or
-are limited to a single segmentation paradigm.  We present \textbf{LeafSegmenter},
-an open-source, cross-platform desktop application that combines the
-state-of-the-art Segment Anything Model~2 (SAM2) with a suite of interactive
-mask-editing, image-enhancement, and model-training tools accessible to
-non-expert users on standard laptop hardware.  The application supports both
-GPU-accelerated inference (CUDA and Apple MPS) and fully CPU-based operation,
-making it accessible without high-performance computing infrastructure.
-Key capabilities include an interactive colour-based mask filter, geometric and
-species-specific leaf-completion templates, a leaf-unfolding module based on
-mirror reflection across the detected fold line, an undo history system, and a
-training pipeline that allows users to distil their curated SAM2 masks into a
-lightweight U-Net model for rapid, automatic deployment on new images.
-Comprehensive phenotyping metrics (area, length, width, shape descriptors,
-colour statistics, and vegetation indices) are exported as structured CSV files.
-LeafSegmenter lowers the barrier to entry for plant phenotyping research
-while remaining extensible to heavier architectures and novel species.
+Accurate segmentation of plant structures in field and greenhouse imagery is essential for high-throughput automated phenotyping. Existing tools often require substantial computing resources, command-line expertise, or support only one segmentation approach. We present \textbf{LeafSegmenter}, an open-source, cross-platform desktop application that combines the Segment Anything Model~2 (SAM2) with interactive mask-editing, image-enhancement, and model-training tools usable by non-experts on standard laptops. The application supports GPU-accelerated inference (CUDA and Apple MPS) and CPU-only operation, avoiding the need for high-performance computing. Key features include an interactive colour-based mask filter, geometric and species-specific leaf-completion templates, a leaf-unfolding module based on mirror reflection across the detected fold line, an undo history, and a training pipeline that distils curated SAM2 masks into a lightweight U-Net for fast, automatic segmentation of new images. Comprehensive phenotyping metrics (area, length, width, shape descriptors, colour statistics, and vegetation indices) are exported as structured CSV files. LeafSegmenter lowers the barrier to plant phenotyping research while remaining extensible to larger models and new species.
 \end{abstract}
 
 \textbf{Keywords:} plant phenotyping, image segmentation, Segment Anything
@@ -78,113 +60,24 @@ Model, vision transformer, interactive tools, leaf morphology, field imaging.
 \newpage
 
 %%──────────────────────────────────────────────────────────────────────────────
+
 \section{Introduction}
 \label{sec:introduction}
 
-Plant phenotyping — the quantitative measurement of plant morphology, colour,
-and structural traits — is central to modern crop improvement programmes and
-fundamental plant biology research \citep{walter2015plant, furbank2011phenomics}.
-The increasing accessibility of digital cameras and unmanned aerial vehicles
-has generated vast quantities of plant imagery from both field trials and
-controlled greenhouse environments, yet the bottleneck in extracting meaningful
-measurements has shifted from image acquisition to accurate, scalable
-\textit{segmentation}: the process of delineating individual plant structures
-from their backgrounds and from one another \citep{pound2017deep}.
+Plant phenotyping is the quantitative measurement of plant morphology, architecture, color, and growth-related traits. It is central to modern crop improvement, stress physiology, and functional plant biology \citep{walter2015plant,furbank2011phenomics}. As genotyping has become faster and cheaper, precise, high-throughput trait measurement has become the main bottleneck in linking genotype, environment, and phenotype
+\citep{pound2017deep,singh2016machine}. Digital imaging partly addresses this by enabling non-destructive measurements in controlled environments, greenhouses, field plots, and UAV platforms, but the bottleneck has shifted from image acquisition to image interpretation. Accurate segmentation of plant organs from backgrounds, soil, trays, shadows, neighboring plants, and overlapping tissues remains essential for reliable trait extraction.
 
-\subsection{Segmentation in Plant Science}
+A segmentation model can be difficult to train because plants vary widely across species, genotypes, developmental stages, imaging platforms, and environments. Leaves can overlap, fold, curl, or occlude each other; field images often have uneven illumination and complex backgrounds; and color differences between target tissues and other objects, such as grass and weeds, can be grass and subtle. Classical methods based on color thresholding, vegetation indices, and morphological operations can work under controlled conditions but often need extensive parameter tuning and fail when lighting, background, or morphology changes \citep{woebbecke1995color,gitelson2002novel}. Deep learning methods, such as U-Net-style semantic segmentation and Mask R-CNN-style instance segmentation, have greatly improved plant segmentation \citep{ronneberger2015unet,he2017mask,pound2017deep}, but supervised models still require large annotated datasets, task-specific training, and
+computational expertise, limiting their use in small laboratories, early-stage projects, and scenarios with scarce annotated data.
 
-Instance segmentation — assigning a distinct mask to each individual object
-(leaf, stem, fruit) in an image — remains one of the most challenging tasks in
-agricultural computer vision.  Leaves overlap, lighting conditions vary
-dramatically between field and greenhouse settings, colour contrasts between
-plant tissue and background are often subtle, and plant morphology varies
-substantially across growth stages, genotypes, and stress conditions
-\citep{singh2016machine, jiang2020deepleaf}.  Early approaches relied on
-classical colour thresholding and morphological operations \citep{aksoy2015use},
-which perform well only under tightly controlled conditions.  The advent of
-deep learning, and convolutional neural networks in particular, substantially
-advanced segmentation quality \citep{mohanty2016using, sa2016deepfruits}, but
-these approaches require large annotated datasets and significant computational
-resources, limiting their adoption outside well-funded research groups.
+Visual foundation models create new opportunities for plant phenotyping. Trained on large, diverse datasets, they can often be adapted to new tasks with little or no task-specific training \citep{bommasani2021opportunities}. The Segment Anything Model (SAM) introduced promptable segmentation, where users guide the model with points, boxes, or masks to obtain object masks in a zero-shot setting \citep{kirillov2023segment}. SAM~2 extends this to images and videos using a promptable segmentation architecture, hierarchical image encoder, and streaming memory, enabling improved interactive segmentation and refinement \citep{ravi2025sam2}. These models are useful for plant phenotyping because many studies need accurate masks but lack resources to annotate and train a new model for each species, organ, or imaging condition.
 
-\subsection{Foundation Models and the Segment Anything Model}
+Applications of SAM to plant phenotyping has shown both promise and limitations. \citet{zhang2024adapting} combined SAM with image–text prompting for zero-shot plant recognition and phenotypic measurement without manually labeled training data. \citet{williams2024leafonlysam} built a zero-shot pipeline for potato leaf segmentation using SAM plus plant-specific post-processing. Their results show that SAM-based methods are useful when annotated data are scarce, but automatic outputs often include background objects, duplicate masks, whole-plant masks, or non-leaf structures that must be filtered before measurements are reliable. Foundation models thus reduce the annotation burden, but practical plant phenotyping still needs human-in-the-loop correction, mask filtering, quality control, and phenotype-specific measurement tools. Transformer-based vision models capture long-range spatial relationships via self-attention and now underpin modern segmentation systems such as SAM and SAM~2 \citep{dosovitskiy2021image,ravi2025sam2}. Yet they are often computationally expensive and rely on large-scale pretraining or carefully tuned training, whereas convolutional models can remain competitive when data or compute are limited \citep{chen2021visformer}. For routine phenotyping, this creates demand for workflows that pair the accuracy and flexibility of foundation models with lightweight models that can be trained from curated masks and quickly deployed on new images. Knowledge distillation and teacher–student training address this need: high-quality masks generated or corrected by a large model can train a smaller model for faster, task-specific inference \citep{hinton2015distilling,zhang2023mobilesam}.
 
-A transformative development in computer vision has been the emergence of
-large-scale \textit{foundation models}: neural networks pre-trained on
-internet-scale datasets that generalise remarkably well to novel domains with
-little or no additional fine-tuning \citep{bommasani2021opportunities}.  For
-image segmentation, Meta AI Research released the Segment Anything Model
-(SAM) in 2023 \citep{kirillov2023segment}, followed by the substantially
-improved SAM~2 in 2024 \citep{ravi2024sam2}.
+Despite these advances, accessible software for plant-focused, interactive, foundation-model segmentation remains scarce. General annotation platforms such as LabelMe offer manual labelling but lack plant-specific enhancement, mask filtering, phenotypic measurement, and model training workflows \citep{russell2008labelme}. PlantCV is a powerful, widely used image-analysis library for plant phenotyping, but is mainly script-based and thus requires programming expertise for many tasks \citep{gehan2017plantcv}. Meanwhile, many SAM-based plant studies appear as pipelines or experimental frameworks rather than integrated desktop applications that let non-expert users load images, segment plants, edit masks, export traits, and train a lightweight model within a single environment.
 
-SAM~2 employs a hierarchical Vision Transformer (ViT) backbone
-\citep{dosovitskiy2020image} coupled with a streaming memory module originally
-designed for video object segmentation.  The ViT backbone divides the input
-image into fixed-size patches, encodes them into high-dimensional token
-representations, and processes them through multi-head self-attention layers
-that capture long-range spatial dependencies without the inductive bias of
-convolutions \citep{vaswani2017attention, wang2022pvt}.  The result is a
-powerful, promptable segmentation model: given point, box, or mask prompts
-from a user, SAM~2 generates high-quality instance masks for arbitrary object
-categories.  Critically, SAM~2 operates in a zero-shot regime — it requires no
-training on plant-specific data to segment leaves, stems, or fruits
-\citep{ravi2024sam2}.
+We present \textbf{PlantSegmenter}, an interactive, python based GPU-linked desktop application for plant image segmentation and phenotyping with SAM~2. PlantSegmenter is not meant to make segmentation easily accessible in everyday plant biology, especially for users with limited programming skills, few annotations, or no high-performance computing. It combines SAM~2-based segmentation with plant-specific image enhancement, color-based mask filtering, interactive mask editing, several phenotype measurements, geometric leaf completion, folded-leaf reconstruction, and a training workflow that turns curated SAM~2 masks into a lightweight U-Net model. The software is available for download from the GitHub repository at: https://github.com/nirwan1265/Image-Segmentation.
 
-Several studies have demonstrated the effectiveness of SAM and SAM~2 for
-agricultural applications, including crop row detection, fruit counting, and
-leaf instance segmentation \citep{wu2023samplant, wang2023samag}.  However,
-direct use of SAM~2 in a research workflow requires Python programming
-knowledge, access to the model weights (up to 2.4~GB), and familiarity with
-its API, presenting a significant barrier for plant biologists without
-computational training.
-
-\subsection{Vision Transformers and Lightweight Alternatives}
-
-While full ViT-based models such as SAM~2 deliver state-of-the-art
-segmentation quality, their inference cost can be prohibitive on standard
-laptop hardware.  Encoder–decoder architectures based on U-Net
-\citep{ronneberger2015unet} paired with lightweight ImageNet-pre-trained
-convolutional encoders (ResNet~\citep{he2016deep}, EfficientNet
-\citep{tan2019efficientnet}) offer a practical trade-off: substantially faster
-inference with moderate accuracy loss.  MobileSAM \citep{zhang2023mobilesam},
-a distilled variant of SAM trained to replicate its image encoder using a
-lightweight ViT-Tiny backbone, achieves segmentation quality close to the full
-SAM while reducing model size by over 60-fold, making deployment on CPU
-feasible.
-
-The knowledge-distillation paradigm — training a compact \textit{student} model
-to reproduce the outputs of a powerful \textit{teacher} model
-\citep{hinton2015distilling} — forms the conceptual basis of the training
-pipeline in the present work: users collect high-quality masks generated by
-SAM~2, then use those masks to supervise training of a lightweight U-Net for
-rapid, class-specific, fully automatic deployment.
-
-\subsection{Motivation and Scope}
-
-Despite the power of modern segmentation models, accessible, interactive
-tooling for plant phenotyping remains scarce.  Tools such as
-LabelMe~\citep{russell2008labelme}, CVAT, and Roboflow provide general-purpose
-annotation interfaces but lack plant-specific enhancement pipelines,
-phenotype measurement modules, or integrated model-training workflows.
-PlantCV~\citep{fahlgren2015plantcv} offers a comprehensive plant image analysis
-library but operates through Python scripts rather than a graphical interface.
-iMeasure and similar tools support morphometric measurements but not
-deep-learning-based segmentation.
-
-We therefore developed \textbf{LeafSegmenter}, an open-source desktop
-application that addresses all of the following requirements simultaneously:
-
-\begin{enumerate}[leftmargin=2em]
-    \item GPU-optional operation: full functionality on laptop CPU, with
-          optional acceleration via CUDA (NVIDIA) or Apple MPS (Apple Silicon).
-    \item Interactive, SAM2-based segmentation with no coding required.
-    \item A rich suite of image-enhancement, mask-editing, and
-          phenotype-measurement tools designed specifically for plant imagery.
-    \item An integrated training pipeline enabling users to convert curated
-          SAM~2 masks into a deployable lightweight model.
-    \item Novel tools for geometric leaf completion and leaf-unfolding
-          reconstruction, extending the utility of partial or occluded masks.
-\end{enumerate}
 
 
 %%──────────────────────────────────────────────────────────────────────────────
@@ -193,9 +86,7 @@ application that addresses all of the following requirements simultaneously:
 
 \subsection{Application Architecture}
 
-LeafSegmenter is implemented in Python~3.11 using the \texttt{tkinter} toolkit
-for the graphical interface.  The application is structured as a modular
-package (\texttt{app/}) comprising seven functional modules:
+PlantSegmenter is implemented in Python~3.11 with a \texttt{tkinter}-based graphical interface. The application is organized as a modular package (\texttt{app}) with seven functional modules:
 
 \begin{itemize}
     \item \texttt{gui\_app.py} — main application class, layout, event handling
@@ -208,44 +99,25 @@ package (\texttt{app/}) comprising seven functional modules:
           \texttt{tab\_train.py} — training panel tab modules
 \end{itemize}
 
-The modular design ensures that computationally intensive functions (image
-enhancement, mask geometry, phenotype measurement) are decoupled from the GUI
-layer and can be invoked independently for batch processing or unit testing.
+The modular design separates computationally intensive functions (image enhancement, mask geometry, phenotype measurement) from the GUI, allowing independent use for batch processing and unit testing.
 
 \subsection{Image Loading and Preprocessing}
 
-The application accepts TIFF, PNG, JPEG, and BMP images.  A built-in TIF
-converter supports conversion of raw field-acquisition formats to standard
-8-bit PNG prior to segmentation.  Images are loaded as RGB \texttt{uint8}
-NumPy arrays via Pillow and OpenCV.
+The application accepts TIFF, PNG, JPEG, and BMP images. A built-in TIF converter converts raw field-acquisition formats to standard 8-bit PNG for segmentation. Images are loaded as RGB \texttt{uint8} NumPy arrays via Pillow and OpenCV python packages.
 
-A rotation module supports arbitrary angle rotation via a dial widget with
-preset shortcuts (45°, 90°, 180°, 270°, $-$45°, $-$90°), allowing correct
-orientation of images acquired at non-standard angles before segmentation.
+A rotation module uses a dial widget with preset angles (45°, 90°, 180°, 270°, $-$45°, $-$90°) and arbitrary rotation to orient images acquired at non-standard angles before segmentation.
 
-\subsection{Image Enhancement Pipeline}
+\subsection{Image Enhancement}
 
-A dedicated enhancement panel provides a sequential processing pipeline
-designed for plant imagery.  The pipeline is configurable through the GUI and
-includes the following operations:
+A dedicated enhancement panel offers a configurable, sequential processing pipeline for plant imagery, including these operations:
 
 \subsubsection{Green-Channel CLAHE Enhancement}
 
-The primary plant-specific enhancement applies Contrast Limited Adaptive
-Histogram Equalisation (CLAHE) \citep{zuiderveld1994clahe} exclusively to the
-value channel (V) of pixels identified as green by HSV thresholding.  This
-selectively improves contrast within leaf tissue while leaving background
-regions unaffected, improving the signal-to-background ratio for SAM~2.
-A bilateral filter \citep{tomasi1998bilateral} is subsequently applied to
-reduce noise while preserving leaf edges, followed by Sobel edge blending
-\citep{sobel1968isotropic} to further accentuate boundary regions.  An unsharp
-masking step \citep{dahl2008contrast} completes the standard plant pipeline.
+The main plant-specific enhancement applies Contrast Limited Adaptive Histogram Equalisation (CLAHE) \citep{zuiderveld1994clahe} only to the value channel (V) of pixels classified as green by HSV thresholding. This boosts contrast within leaf tissue while leaving the background unchanged, improving the signal-to-background ratio for SAM~2. A bilateral filter \citep{tomasi1998bilateral} then reduces noise while preserving leaf edges, followed by Sobel edge blending \citep{sobel1968isotropic} to highlight boundaries. An unsharp masking step \citep{dahl2008contrast} concludes the standard plant pipeline.
 
 \subsubsection{Vegetation Indices}
 
-The application computes five widely used vegetation indices from the RGB
-channels, which may be used either as visual enhancement overlays or as
-input features for downstream analysis:
+The application computes five common vegetation indices from the RGB channels, usable as visual overlays or input features for downstream analysis:
 
 \begin{itemize}
     \item \textbf{ExG} (Excess Green): $\mathrm{ExG} = 2G - R - B$
@@ -285,12 +157,7 @@ conditions:
 
 \subsection{SAM2-Based Segmentation}
 
-LeafSegmenter integrates SAM~2 \citep{ravi2024sam2} via the official Python
-API.  The user specifies a SAM~2 checkpoint (Hiera-Small, Hiera-Large, etc.\
-or a bundled \texttt{.pt} file) and the target compute device (CPU, CUDA, or
-Apple MPS).  Segmentation is triggered on the current image after enhancement,
-producing a set of instance masks via \texttt{SAM2AutomaticMaskGenerator} with
-fully configurable hyperparameters exposed in the GUI:
+PlantSegmenter integrates SAM~2 \citep{ravi2024sam2} via the official Python API. The user selects a SAM~2 checkpoint (e.g., Hiera-Small, Hiera-Large, or a bundled \texttt{.pt} file) and the compute device (CPU, CUDA, or Apple MPS). After image enhancement, segmentation runs on the current image using \texttt{SAM2AutomaticMaskGenerator}, with all hyperparameters configurable in the GUI:
 
 \begin{itemize}
     \item \texttt{points\_per\_side}: grid density of prompt points.
@@ -303,11 +170,7 @@ fully configurable hyperparameters exposed in the GUI:
     \item \texttt{use\_m2m}: mask-to-mask refinement flag.
 \end{itemize}
 
-Hover tooltips in the GUI provide plain-language explanations of each
-parameter.  After generation, masks are deduplicated by Intersection-over-Union
-(IoU $> 0.80$) and split into single-connected-component instances.  Batch
-segmentation processes an entire folder, caching results in memory for
-subsequent review and export.
+Hover tooltips in the GUI also explain each parameter. After generation, masks are deduplicated using Intersection-over-Union (IoU $> 0.80$) and split into single-connected-component instances. Batch segmentation processes an entire folder, caching results in memory for later review and export.
 
 \subsection{Mask Editing Tools}
 
@@ -329,42 +192,22 @@ A dedicated Masks panel provides interactive editing operations:
 An undo history system (up to 50 states) captures the full mask list before
 each destructive operation, enabling recovery via Ctrl+Z (or Cmd+Z on macOS).
 
-\subsection{Colour-Based Mask Filtering}
+\subsection{Color-Based Mask Filtering}
 
-A colour filter panel provides interactive mask selection based on pixel
-colour statistics.  An interactive two-dimensional Hue $\times$ Saturation
-picker renders the full HSV colour space as a gradient.  Users drag
-rectangles on the picker to define one or more colour ranges; these are
-combined with OR logic.  An eyedropper tool samples a pixel directly from the
-preview canvas, placing a crosshair marker on the picker at the sampled
-position and automatically generating a selection rectangle with a sensible
-tolerance.  A separate brightness (Value) range control applies globally across
-all selections.  The filter operates on the mean HSV colour of each mask's
-constituent pixels, allowing rapid removal of soil, background, or specular
-highlight masks without manual selection.
+A color filter panel enables interactive mask selection from pixel color statistics. A 2D Hue × Saturation picker renders the HSV space as a gradient, where users drag rectangles to define color ranges combined with OR logic. An eyedropper samples pixels from the preview canvas, places a crosshair on the picker, and auto-creates a selection rectangle with suitable tolerance. A global brightness (Value) range control applies to all selections. The filter uses the mean HSV color of each mask’s pixels, allowing fast removal of soil, background, or specular highlight masks without manual selection.
 
 \subsection{Leaf Shape Completion}
 \label{sec:completion}
 
-Many plant images contain partially occluded or truncated leaves.  To support
-reconstruction of the complete leaf area for morphometric analysis, LeafSegmenter
-includes a leaf completion module offering two complementary shape galleries:
+Many plant images contain partially occluded or truncated leaves. To enable complete leaf reconstruction for morphometric analysis, PlantSegmenter includes a leaf completion module with two complementary shape galleries:
 
 \subsubsection{Geometric Shape Gallery}
 
-Eighteen botanical leaf forms are available (Orbicular, Elliptical, Ovate,
-Obovate, Cordate, Reniform, Lanceolate, Oblanceolate, Oblong, Linear,
-Ensiform, Cuneate, Spathulate, Deltoid, Rhomboid, Sagittate, Hastate, and a
-general Ellipse), each rendered as a silhouette thumbnail using parametric
-polygon definitions.
+Eighteen botanical leaf forms—Orbicular, Elliptical, Ovate, Obovate, Cordate, Reniform, Lanceolate, Oblanceolate, Oblong, Linear, Ensiform, Cuneate, Spathulate, Deltoid, Rhomboid, Sagittate, Hastate, and a general Ellipse—are provided as silhouette thumbnails defined by parametric polygons.
 
 \subsubsection{Crop Species Gallery}
 
-Eighteen crop-specific silhouettes are provided, traced from documented leaf
-morphology: Maize, Wheat, Sorghum, Rice, Barley (monocots with narrow strap
-leaves), Arabidopsis (rosette form), Tomato and Potato (pinnate compound),
-Soybean (trifoliate), Sunflower, Tobacco, Cassava (palmate), Cotton, Grape,
-Common Bean, Cucumber, Pepper, and Lettuce.
+Eighteen crop-specific silhouettes are provided, traced from documented leaf morphology: Maize, Wheat, Sorghum, Rice, and Barley (narrow strap-leaf monocots); Arabidopsis (rosette); Tomato and Potato (pinnate compound); Soybean (trifoliate); Sunflower, Tobacco, Cassava (palmate); and Cotton, Grape, Common Bean, Cucumber, Pepper, and Lettuce.
 
 \subsubsection{Alignment Algorithm}
 
@@ -383,25 +226,14 @@ three sequential alignment steps:
           PCA-derived major and minor axis lengths of the mask.
 \end{enumerate}
 
-The aligned template is rasterised at full image resolution and merged with
-the original mask (preserving all original pixels).  Fine adjustments to
-scale, position (drag), and rotation angle are available interactively before
-the completed mask is committed.
+The aligned template is rasterised at full resolution and merged with the original mask (preserving all pixels). Fine interactive adjustments to scale, position, and rotation are available before committing the final mask.
 
 \subsection{Leaf Unfolding Reconstruction}
 \label{sec:unfolding}
 
-Folded leaves are common in greenhouse and field imagery, particularly in
-maize, sorghum, and wheat.  A dedicated Leaf Unfolding module reconstructs
-the complete leaf by mirroring the folded portion across the detected fold
-line.
+Folded leaves are common in greenhouse and field imagery, especially for maize, sorghum, and wheat. A Leaf Unfolding module reconstructs the full leaf by mirroring the folded part across an automatically detected fold line.
 
-The fold line is detected automatically as the junction boundary between two
-selected masks (representing the two halves of the folded leaf).  Both masks
-are dilated morphologically and their intersection defines the junction zone.
-Singular Value Decomposition (SVD) is applied to the junction pixel
-coordinates, with the first right singular vector defining the fold line
-direction.  Each pixel $\mathbf{p}$ of the folded mask is then reflected as:
+The fold line is found as the boundary between two selected masks representing the folded halves. Both masks are morphologically dilated, and their intersection defines a junction zone. Singular Value Decomposition (SVD) on the junction pixel coordinates yields the fold line direction as the first right singular vector. Each pixel $\mathbf{p}$ of the folded mask is then reflected as:
 
 \begin{equation}
     \mathbf{p}' = \mathbf{p} - 2\left[(\mathbf{p} - \boldsymbol{\mu}) \cdot
@@ -409,12 +241,7 @@ direction.  Each pixel $\mathbf{p}$ of the folded mask is then reflected as:
     \label{eq:reflection}
 \end{equation}
 
-where $\boldsymbol{\mu}$ is a point on the fold line and $\hat{\mathbf{n}}$
-is the unit normal to the fold line direction.  The reflected mask is
-morphologically closed to fill rounding artefacts, and the corresponding image
-pixels are mapped to their reflected positions.  The user may fine-tune the
-fold line angle ($\pm$5° increments) and shift the mirrored piece interactively
-before applying.
+where $\boldsymbol{\mu}$ is a point on the fold line and $\hat{\mathbf{n}}$ is its unit normal. The reflected mask is morphologically closed to remove rounding artefacts, and the corresponding image pixels are mapped to their reflected locations. Before applying, the user can interactively adjust the fold line angle (in $\pm$5° steps) and shift the mirrored piece.
 
 \subsection{Phenotype Measurement and Export}
 
@@ -451,47 +278,26 @@ crops.
 \label{sec:training}
 
 To enable rapid, class-specific segmentation without SAM~2 at inference time,
-LeafSegmenter includes an integrated training pipeline.
+PlantSegmenter includes an integrated training pipeline.
 
 \subsubsection{Data Collection}
 
-Users collect training examples through normal SAM~2-assisted segmentation:
-after segmenting an image, selected masks are added to a structured dataset
-(images in \texttt{images/}, binary masks in \texttt{masks/}) via a single
-button press.  Images may also be marked as negative examples (no target
-present).
+Users gather training examples during normal SAM~2-assisted segmentation: after segmenting an image, selected masks are added to a structured dataset (images in \texttt{images/}, binary masks in \texttt{masks/}) with one button press. Images can also be labeled as negative examples (no target present).
 
 \subsubsection{Model Architecture}
 
-The default architecture is a U-Net \citep{ronneberger2015unet} with a
-ResNet-18 \citep{he2016deep} encoder pre-trained on ImageNet
-\citep{deng2009imagenet}, implemented via the
-\texttt{segmentation-models-pytorch} library \citep{yakubovskiy2019smp}.
-A lightweight alternative (\texttt{unet\_small}) omits the pre-trained encoder
-for resource-constrained scenarios.  The binary segmentation decoder produces
-a single-channel output mask.
+The default architecture is a U-Net \citep{ronneberger2015unet} with a ResNet-18 \citep{he2016deep} encoder pre-trained on ImageNet \citep{deng2009imagenet}, implemented using \texttt{segmentation-models-pytorch} \citep{yakubovskiy2019smp}. A lightweight variant (\texttt{unet\_small}) omits the pre-trained encoder for resource-constrained settings. The binary decoder outputs a single-channel mask.
 
 \subsubsection{Training Procedure}
 
-Training uses the Adam optimiser \citep{kingma2014adam} with a configurable
-learning rate (default $10^{-5}$), batch size, image size, device, and number
-of gradient steps.  A weighted binary cross-entropy loss accounts for class
-imbalance between foreground and background pixels.  Training can be resumed
-from an existing checkpoint.  All hyperparameters are exposed in the GUI
-without requiring code modification.
+Training uses the Adam optimiser \citep{kingma2014adam} with configurable learning rate (default $10^{-5}$), batch size, image size, device, and gradient steps. A weighted binary cross-entropy loss addresses foreground–background class imbalance. Training can be resumed from a checkpoint, and all hyperparameters are configurable via the GUI without code changes.
 
 \subsubsection{Inference}
 
-The trained model accepts arbitrary-resolution images, applies the same
-enhancement pipeline as SAM~2 segmentation, and produces instance masks via
-connected-component analysis of the thresholded output probability map.  A
-sliding-window (tile-based) inference mode handles large images by processing
-overlapping tiles and merging predictions.  An optional colour-guided tile
-scanning mode restricts tile processing to regions containing plant-coloured
-pixels, substantially reducing inference time on large field images.
+The trained model accepts arbitrary-resolution images, runs the same enhancement pipeline as SAM~2 segmentation, and generates instance masks via connected-component analysis on a thresholded probability map. A sliding-window inference mode processes large images using overlapping tiles and merges predictions, while an optional colour-guided mode restricts tiles to plant-coloured regions to substantially reduce inference time on large field images.
 
 %%──────────────────────────────────────────────────────────────────────────────
-\section*{Acknowledgements}
+\section*{Results}
 
 [Your acknowledgements here.]
 
