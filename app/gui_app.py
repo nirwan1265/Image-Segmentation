@@ -1,73 +1,119 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Leaf Segmenter – interactive GUI for enhancement + SAM2 auto-masking + selective saving.
+gui_app.py
+==========
+LeafSegmenterGUI — complete application class.
 
-Run:  python plant_segmenter.py
+Pure-function work is delegated to:
+  app_visuals.py      ← colours, styles, ToolTip, AnimatedSpinner
+  image_processing.py ← image enhancement (no GUI)
+  mask_utils.py       ← mask math / shape completion (no GUI)
+  phenotyping.py      ← measurements and CSV export (no GUI)
+  sam2_utils.py       ← SAM2 model loading helpers
 
-Requires: numpy, Pillow, opencv-python, torch, hydra, omegaconf, and your local
-SAM2 repo installed (or PYTHONPATH to it) so that build_sam2 / generators import.
+Run:
+    python plant_segmenter.py
 """
 
+# ── stdlib ────────────────────────────────────────────────────────────────────
 import os
+import sys
+import csv
+import json
+import math
+import re
+import shlex
+import shutil
 import signal
 import tempfile
-import csv
 import threading
-from pathlib import Path
+import traceback
+import logging
+import time
+import colorsys
 from dataclasses import dataclass
-import torch
+from pathlib import Path
 
+# ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
 import cv2
+import torch
 from PIL import Image, ImageTk
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-import json, time, shutil
-import subprocess, shlex, sys
-
-
-# Hydra/OmegaConf
+# ── Hydra / OmegaConf ─────────────────────────────────────────────────────────
 from hydra import initialize_config_dir, compose
 from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+try:
+    from omegaconf import DictConfig
+except Exception:
+    class DictConfig:
+        pass
 
-# --- SAM2 imports (repo must be importable) ---
+# ── SAM2 (optional) ───────────────────────────────────────────────────────────
 try:
     from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
     from sam2.build_sam import build_sam2
-except Exception as e:  # keep friendly error for GUI
+    _sam2_import_error = None
+except Exception as _e:
     SAM2AutomaticMaskGenerator = None
     build_sam2 = None
-    _sam2_import_error = e
-else:
-    _sam2_import_error = None
+    _sam2_import_error = _e
 
 try:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 except Exception:
     SAM2ImagePredictor = None
 
-from hydra import initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
-from omegaconf import OmegaConf
+# ── local modules ─────────────────────────────────────────────────────────────
+from app_visuals import COLORS, ICONS, apply_theme, ToolTip, AnimatedSpinner, status_color
+from image_processing import (
+    ensure_uint8_rgb, rotate_left_90,
+    preprocess_for_edges, enhance_leaf_edges_rgb, flatten_background_whiten,
+    compute_vegetation_indices, enhance_with_vegetation_index,
+    denoise_nlm, single_scale_retinex, multi_scale_retinex,
+    morphological_tophat, guided_filter_enhance, enhance_lab_green,
+    white_balance_grayworld, white_balance_max_white,
+    difference_of_gaussians, local_contrast_normalization,
+    adaptive_gamma, shadow_highlight_correction,
+)
+from mask_utils import (
+    _ensure_mask_2d, _resize_mask_to_image,
+    save_binary_mask, save_masked_crop_rgba,
+    mask_iou, dedupe_by_mask_iou, split_masks_by_cc,
+    predict_extend_mask,
+)
+from phenotyping import (
+    _color_stats, _color_stats_hsv,
+    _pca_angle_deg, _pca_major_minor, _length_width_after_deskew,
+    compute_phenotypes, build_individual_rows, build_joint_row,
+    write_individual_csv, write_joint_csv,
+)
+from sam2_utils import (
+    _hydra_reinit_to_dir, _compose_from_yaml, _resolve_sam2_cfg,
+    make_mask_generator,
+)
 
-# =========================
-# Image helpers (RGB uint8)
-# =========================
-def _hydra_reinit_to_dir(cfg_dir: str):
-    try:
-        GlobalHydra.instance().clear()
-    except Exception:
-        pass
-    initialize_config_dir(config_dir=cfg_dir, job_name="sam2_gui")
+import tab_train
+import tab_leaf_completion
+import tab_leaf_unfolding
+import color_filter
 
-import traceback
-import logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+# ── Shared data structures ─────────────────────────────────────────────────────
+@dataclass
+class SegResult:
+    masks: list
+    img_color: np.ndarray
+    img_seg: np.ndarray
+    rotate_applied: bool
+
+# ── GUI error helpers ──────────────────────────────────────────────────────────
 def _show_info(msg, title="Info"):
     try:
         messagebox.showinfo(title, str(msg) if msg else "(no details)")
@@ -82,1510 +128,18 @@ def _show_err(where, exc):
     except Exception:
         pass
 
-
-# ---------- phenotyping helpers ----------
-import math, re
-
-def _ensure_mask_2d(mask_bool):
-    """Normalize mask to 2D boolean array (handles HxWx1, HxWx3, or 1xHxW inputs)."""
-    if mask_bool is None:
-        return None
-    m = np.asarray(mask_bool)
-    if m.ndim == 3:
-        # Handle batch dimension first (1, H, W)
-        if m.shape[0] == 1:
-            m = m[0]
-        # Handle channel dimension last (H, W, 1) or (H, W, 3)
-        elif m.shape[2] == 1:
-            m = m[..., 0]
-        else:
-            # collapse any color channels
-            m = np.max(m, axis=2)
-    elif m.ndim == 4:
-        # Handle (1, 1, H, W) or similar
-        m = m.squeeze()
-    return (m > 0)
-
-def _resize_mask_to_image(mask_bool, img):
-    """Resize mask to match image dimensions if needed."""
-    if mask_bool is None:
-        return None
-    img_H, img_W = img.shape[:2]
-    mask_H, mask_W = mask_bool.shape[:2]
-    if mask_H != img_H or mask_W != img_W:
-        mask_bool = cv2.resize(
-            mask_bool.astype(np.uint8), (img_W, img_H),
-            interpolation=cv2.INTER_NEAREST
-        ).astype(bool)
-    return mask_bool
-
-def _color_stats(rgb, mask_bool):
-    mask_bool = _ensure_mask_2d(mask_bool)
-    if mask_bool is None:
-        def empty(): return dict(mean=0.0, median=0.0, sum=0.0, std=0.0)
-        return empty(), empty(), empty()
-    mask_bool = _resize_mask_to_image(mask_bool, rgb)
-    R = rgb[..., 0][mask_bool].astype(np.float32)
-    G = rgb[..., 1][mask_bool].astype(np.float32)
-    B = rgb[..., 2][mask_bool].astype(np.float32)
-
-    def stats(ch):
-        if ch.size == 0:
-            return dict(mean=0.0, median=0.0, sum=0.0, std=0.0)
-        return dict(mean=float(ch.mean()), median=float(np.median(ch)),
-                    sum=float(ch.sum()), std=float(ch.std()))
-    return stats(R), stats(G), stats(B)
-
-def _color_stats_hsv(rgb, mask_bool):
-    """
-    Compute H/S/V channel stats over the masked region.
-    OpenCV HSV: H∈[0,179], S,V∈[0,255] for uint8.
-    """
-    if rgb.dtype != np.uint8:
-        rgb8 = np.clip(rgb, 0, 255).astype(np.uint8)
-    else:
-        rgb8 = rgb
-    hsv = cv2.cvtColor(rgb8, cv2.COLOR_RGB2HSV)
-    mask_bool = _ensure_mask_2d(mask_bool)
-    if mask_bool is None:
-        def empty(): return dict(mean=0.0, median=0.0, sum=0.0, std=0.0)
-        return empty(), empty(), empty()
-    mask_bool = _resize_mask_to_image(mask_bool, hsv)
-    H = hsv[..., 0][mask_bool].astype(np.float32)
-    S = hsv[..., 1][mask_bool].astype(np.float32)
-    V = hsv[..., 2][mask_bool].astype(np.float32)
-
-    def stats(ch):
-        if ch.size == 0:
-            return dict(mean=0.0, median=0.0, sum=0.0, std=0.0)
-        return dict(mean=float(ch.mean()),
-                    median=float(np.median(ch)),
-                    sum=float(ch.sum()),
-                    std=float(ch.std()))
-    return stats(H), stats(S), stats(V)
-
-
-def _pca_angle_deg(mask_bool):
-    ys, xs = np.nonzero(mask_bool)
-    if xs.size < 2:
-        return 0.0
-    pts = np.stack([xs, ys], axis=1).astype(np.float32)
-    pts -= pts.mean(axis=0, keepdims=True)
-    _, _, Vt = np.linalg.svd(pts, full_matrices=False)
-    vx, vy = Vt[0, 0], Vt[0, 1]
-    return math.degrees(math.atan2(vy, vx))
-
-def _rotate_mask(mask_bool, angle_deg):
-    h, w = mask_bool.shape
-    M = cv2.getRotationMatrix2D((w/2.0, h/2.0), angle_deg, 1.0)
-    m_u8 = (mask_bool.astype(np.uint8) * 255)
-    m_rot = cv2.warpAffine(m_u8, M, (w, h), flags=cv2.INTER_NEAREST,
-                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    return (m_rot > 0)
-
-def _length_width_after_deskew(mask_bool):
-    """Rotate so major axis is vertical; length from vertical span; width from row spans."""
-    ang = _pca_angle_deg(mask_bool)
-    m_rot = _rotate_mask(mask_bool, -ang)
-
-    h, w = m_rot.shape
-    rows_present = np.any(m_rot, axis=1)
-    y_idx = np.where(rows_present)[0]
-    if y_idx.size == 0:
-        return dict(angle_deg=-ang, length_px=0.0, width_px_max=0.0, width_px_p95=0.0)
-
-    y_top, y_bot = int(y_idx.min()), int(y_idx.max())
-    length_px = float(y_bot - y_top + 1)
-
-    widths = []
-    for y in range(y_top, y_bot + 1):
-        xs = np.where(m_rot[y])[0]
-        if xs.size:
-            widths.append(xs.max() - xs.min() + 1)
-    widths = np.array(widths, dtype=np.float32) if len(widths) else np.array([0.0], dtype=np.float32)
-    return dict(
-        angle_deg=-ang,
-        length_px=float(length_px),
-        width_px_max=float(widths.max()),
-        width_px_p95=float(np.percentile(widths, 95))
-    )
-
-def _pca_major_minor(mask_bool):
-    ys, xs = np.nonzero(mask_bool)
-    if xs.size < 2:
-        axis_w  = int(xs.max()-xs.min()+1 if xs.size else 0)
-        axis_h  = int(ys.max()-ys.min()+1 if ys.size else 0)
-        return 0.0, 0.0, axis_w, axis_h
-    pts = np.stack([xs, ys], axis=1).astype(np.float32)
-    mu = pts.mean(axis=0, keepdims=True)
-    X = pts - mu
-    _, _, Vt = np.linalg.svd(X, full_matrices=False)
-    V = Vt.T
-    proj = X @ V
-    length_major = proj[:, 0].max() - proj[:, 0].min()
-    width_minor  = proj[:, 1].max()  - proj[:, 1].min()
-    axis_w  = xs.max() - xs.min() + 1
-    axis_h  = ys.max() - ys.min() + 1
-    return float(length_major), float(width_minor), int(axis_w), int(axis_h)
-
-
-# ====== Predict/Extend helpers (non-ML shape completion) ======
-def _mask_to_contour_pts(mask_bool: np.ndarray):
-    m8 = (mask_bool.astype(np.uint8) * 255)
-    cnts, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.int32)
-    return np.ascontiguousarray(pts)
-
-def _rosette_circle_extend(mask_bool: np.ndarray, strength=1.0):
-    """
-    Arabidopsis-style completion: fit a circle and grow it a bit.
-    strength ~ 0.7..1.5  (1.0 is a mild, safe grow)
-    """
-    pts = _mask_to_contour_pts(mask_bool)
-    if pts is None or pts.shape[0] < 3:
-        return mask_bool
-    (cx, cy), r = cv2.minEnclosingCircle(pts.astype(np.float32))
-    # increase radius gently
-    r2 = float(r) * (1.10 + 0.20 * (float(strength) - 1.0))  # ~+10% at strength=1
-    H, W = mask_bool.shape
-    out = np.zeros((H, W), dtype=np.uint8)
-    cv2.circle(out, (int(round(cx)), int(round(cy))), int(round(r2)), 1, thickness=-1)
-    return np.logical_or(mask_bool, out.astype(bool))
-
-def _convex_hull_fill(mask_bool: np.ndarray):
-    pts = _mask_to_contour_pts(mask_bool)
-    if pts is None or pts.shape[0] < 3:
-        # nothing to hull or too few points
-        return mask_bool
-
-    # Hull as Nx2 int32, contiguous
-    hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.int32)
-    hull = np.ascontiguousarray(hull)
-
-    # Destination image must be C-contiguous uint8
-    H, W = mask_bool.shape[:2]
-    hull_mask = np.zeros((H, W), dtype=np.uint8)
-    hull_mask = np.ascontiguousarray(hull_mask)
-
-    # Fill
-    cv2.fillConvexPoly(hull_mask, hull, 1)
-
-    return hull_mask.astype(bool)
-
-
-
-def _largest_component_bool(mask_bool: np.ndarray):
-    """Return largest connected component (4-conn) as bool, or None."""
-    m = (mask_bool.astype(np.uint8) > 0).astype(np.uint8)
-    num, lab = cv2.connectedComponents(m, connectivity=4)
-    if num <= 1:
-        return None
-    # bincount over labels (skip background 0)
-    counts = np.bincount(lab.ravel())
-    lbl = int(np.argmax(counts[1:]) + 1)
-    comp = (lab == lbl)
-    return comp
-
-def _rosette_hull_wedge_extend(mask_bool: np.ndarray, strength=1.0):
-    """
-    Arabidopsis-style: fill only the largest convexity 'wedge' (hull - mask).
-    strength: 0.7..1.5 -> controls slight dilation of the wedge.
-    """
-    # 1) convex hull of visible mask
-    hull_bool = _convex_hull_fill(mask_bool)
-    # 2) candidate wedges = hull minus mask
-    added = np.logical_and(hull_bool, ~mask_bool)
-    if not added.any():
-        return mask_bool  # nothing to add
-    # 3) keep largest wedge only
-    wedge = _largest_component_bool(added)
-    if wedge is None or not wedge.any():
-        return mask_bool
-    # 4) optional gentle dilation of the wedge
-    if strength > 1.01:
-        k = max(1, int(round(2 * (strength - 1.0))))  # small kernel
-        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*k+1, 2*k+1))
-        wedge = cv2.morphologyEx(wedge.astype(np.uint8), cv2.MORPH_DILATE, se).astype(bool)
-    # 5) final
-    return np.logical_or(mask_bool, wedge)
-
-def _rosette_ellipse_scale_extend(mask_bool: np.ndarray, scale=1.12):
-    pts = _mask_to_contour_pts(mask_bool)
-    if pts is None or pts.shape[0] < 5:
-        return mask_bool
-    try:
-        (cx, cy), (MA, ma), ang = cv2.fitEllipse(pts.astype(np.float32))
-    except cv2.error:
-        return mask_bool
-    MA2, ma2 = max(3, MA*scale), max(3, ma*scale)
-    H, W = mask_bool.shape
-    out = np.zeros((H, W), dtype=np.uint8)
-    cv2.ellipse(out, (int(round(cx)), int(round(cy))), (int(round(MA2/2)), int(round(ma2/2))),
-                ang, 0, 360, 1, thickness=-1)
-    return np.logical_or(mask_bool, out.astype(bool))
-
-
-
-
-def _pca_orientation_full(mask_bool: np.ndarray):
-    ys, xs = np.nonzero(mask_bool)
-    if xs.size < 10:
-        return None
-    X = np.column_stack([xs, ys]).astype(np.float32)
-    mu = X.mean(axis=0)
-    Xc = X - mu
-    cov = (Xc.T @ Xc) / max(1, len(Xc)-1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    vmaj = eigvecs[:, order[0]]
-    vmaj = vmaj / (np.linalg.norm(vmaj) + 1e-8)
-    vperp = np.array([-vmaj[1], vmaj[0]], dtype=np.float32)
-    proj = (Xc @ vmaj)
-    length = float(proj.max() - proj.min())
-    width  = float((Xc @ vperp).max() - (Xc @ vperp).min())
-    return mu, vmaj, vperp, length, width, X, proj
-
-def _tapered_extension(mask_bool: np.ndarray, k_extend=0.6):
-    """Extend along major axis by k_extend * current length with a triangular taper."""
-    H, W = mask_bool.shape
-    info = _pca_orientation_full(mask_bool)
-    if info is None:
-        return mask_bool
-    mu, vmaj, vperp, length, width, X, proj = info
-
-    # tip direction = side with larger mean projection
-    tip_is_plus = proj.mean() > 0
-    direction = vmaj if tip_is_plus else -vmaj
-
-    extend_len = max(8.0, k_extend * max(20.0, length))
-    front_thr  = np.percentile(proj, 85)
-    proj_vals  = proj
-    front_max  = proj_vals.max() if tip_is_plus else -proj_vals.min()
-    base_center = mu + direction * (front_max)
-
-    base_width = max(4.0, 0.5 * width)
-    half_base  = 0.5 * base_width
-
-    tip = mu + direction * (front_max + extend_len)
-    p1  = base_center + vperp * half_base
-    p2  = base_center - vperp * half_base
-
-    poly = np.stack([p1, p2, tip]).astype(np.int32)
-    ext = np.zeros_like(mask_bool, dtype=np.uint8)
-    cv2.fillConvexPoly(ext, poly, 1)
-    ext = cv2.morphologyEx(ext, cv2.MORPH_DILATE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
-    return (mask_bool | (ext > 0))
-
-
-
-def predict_extend_mask(mask_bool: np.ndarray, method: str = "auto", strength: float = 1.0,
-                        forbid_mask: np.ndarray | None = None):
-    """
-    Non-ML mask completion. Returns a new bool mask (same shape).
-    method: 'auto' | 'rosette' | 'blade'
-    """
-    if mask_bool is None:
-        return None
-    base = mask_bool.astype(bool)
-    mode = (method or "auto").lower().strip()
-
-    # choose mode based on shape if auto
-    if mode == "auto":
-        maj, minw, *_ = _pca_major_minor(base)
-        ratio = (maj / (minw + 1e-6)) if minw >= 0 else 0.0
-        mode = "blade" if ratio >= 2.2 else "rosette"
-
-    if mode == "blade":
-        pred = _tapered_extension(base, k_extend=0.6 * float(strength))
-    else:
-        # rosette-style: hull wedge first; fallback to circle/ellipse growth
-        pred = _rosette_hull_wedge_extend(base, strength=float(strength))
-        if pred is None or np.array_equal(pred, base):
-            pred = _rosette_circle_extend(base, strength=float(strength))
-
-    pred = pred.astype(bool)
-    if forbid_mask is not None:
-        pred = np.logical_and(pred, ~forbid_mask.astype(bool))
-        pred = np.logical_or(base, pred)
-    return pred
-
-
-
-
-from pathlib import Path
-from omegaconf import OmegaConf
-try:
-    from omegaconf import DictConfig
-except Exception:
-    class DictConfig:  # fallback
-        pass
-
-from hydra import initialize_config_dir, compose
-from hydra.core.global_hydra import GlobalHydra
-
-def _compose_from_yaml(yaml_path: str):
-    conf_dir = str(Path(yaml_path).parent)
-    conf_name = Path(yaml_path).stem
-    GlobalHydra.instance().clear()
-    with initialize_config_dir(config_dir=conf_dir, job_name="sam2_gui", version_base=None):
-        return compose(config_name=conf_name)
-
-def _resolve_sam2_cfg(cfg_field, ckpt_path: str | None = None, fallback_short="sam2.1_hiera_l"):
-    if cfg_field is None:
-        return fallback_short
-    if isinstance(cfg_field, DictConfig):
-        return cfg_field
-    if isinstance(cfg_field, dict):
-        return OmegaConf.create(cfg_field)
-
-    s = str(cfg_field).strip()
-    if not s:
-        return fallback_short
-
-    p = Path(s)
-    if p.is_file() and s.lower().endswith((".yaml", ".yml")):
-        return _compose_from_yaml(s)
-
-    if p.is_dir():
-        guess = p / "sam2.1_hiera_l.yaml"
-        if guess.exists():
-            return _compose_from_yaml(str(guess))
-        for y in sorted(p.glob("*.y*ml")):
-            if "hiera" in y.stem:
-                return _compose_from_yaml(str(y))
-        cands = sorted(p.glob("*.y*ml"))
-        if cands:
-            return _compose_from_yaml(str(cands[0]))
-
-    guesses = []
-    env_dir = os.environ.get("SAM2_CONFIG_DIR")
-    if env_dir:
-        guesses += [str(Path(env_dir) / "sam2.1"), env_dir]
-    if ckpt_path:
-        ck = Path(ckpt_path)
-        repo_root = ck.parent.parent if ck.suffix == ".pt" else ck.parent
-        guesses += [str(repo_root / "configs" / "sam2.1"), str(repo_root / "configs")]
-    for d in guesses:
-        y = Path(d) / f"{s}.yaml"
-        if y.exists():
-            return _compose_from_yaml(str(y))
-
-    return s  # let build_sam2 resolve a package-shortname
-
-
-
-
-
-def ensure_uint8_rgb(arr):
-    arr = np.array(arr)
-    if arr.ndim == 2:
-        arr = np.stack([arr] * 3, axis=-1)
-    elif arr.ndim == 3 and arr.shape[2] == 4:
-        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
-    if arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return np.ascontiguousarray(arr)
-
-def rotate_left_90(img_rgb_uint8: np.ndarray) -> np.ndarray:
-    return cv2.rotate(img_rgb_uint8, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-def save_binary_mask(mask_bool, out_path):
-    out = (mask_bool.astype(np.uint8) * 255)
-    cv2.imwrite(str(out_path), out)
-
-def save_masked_crop_rgba(image_rgb_uint8, mask_bool, bbox, out_path, erode_px=0, feather_px=0):
-    """Save transparent crop (halo-less if you use erode/feather)."""
-    x, y, w, h = map(int, bbox)
-    x2, y2 = x + w, y + h
-    x, y = max(0, x), max(0, y)
-
-    crop_img = image_rgb_uint8[y:y2, x:x2, :]
-    crop_msk = mask_bool[y:y2, x:x2].astype(np.uint8)
-
-    if erode_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, 2*erode_px+1),)*2)
-        crop_msk = cv2.erode(crop_msk, k, iterations=1)
-
-    if feather_px > 0:
-        dist = cv2.distanceTransform((crop_msk > 0).astype(np.uint8), cv2.DIST_L2, 3)
-        alpha = np.clip(dist / float(feather_px), 0, 1) * 255.0
-        alpha = alpha.astype(np.uint8)
-    else:
-        alpha = crop_msk * 255
-
-    rgba = np.dstack([crop_img, alpha])
-    cv2.imwrite(str(out_path), cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
-
-def mask_iou(a_bool, b_bool):
-    inter = np.logical_and(a_bool, b_bool).sum()
-    union = np.logical_or(a_bool, b_bool).sum() + 1e-6
-    return inter / union
-
-def dedupe_by_mask_iou(masks, iou_thresh=0.80):
-    kept = []
-    for m in sorted(masks, key=lambda z: z["area"], reverse=True):
-        seg = m["segmentation"].astype(bool)
-        if any(mask_iou(seg, k["segmentation"].astype(bool)) > iou_thresh for k in kept):
-            continue
-        kept.append(m)
-    return kept
-
-def split_masks_by_cc(masks, min_area=50, max_components=None):
-    """
-    Split masks that contain multiple disconnected components into separate masks.
-    Returns a new list (original multi-blob mask is replaced by its components).
-    """
-    out = []
-    for m in masks:
-        seg = m.get("segmentation")
-        if not isinstance(seg, np.ndarray):
-            out.append(m)
-            continue
-        seg_u8 = (seg > 0).astype(np.uint8)
-        if seg_u8.ndim != 2:
-            # unexpected shape; keep original
-            out.append(m)
-            continue
-
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seg_u8, connectivity=8)
-        if num_labels <= 2:
-            out.append(m)
-            continue
-
-        comps = []
-        for label in range(1, num_labels):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area < int(min_area):
-                continue
-            x = int(stats[label, cv2.CC_STAT_LEFT])
-            y = int(stats[label, cv2.CC_STAT_TOP])
-            w = int(stats[label, cv2.CC_STAT_WIDTH])
-            h = int(stats[label, cv2.CC_STAT_HEIGHT])
-            comp_seg = (labels == label).astype(np.uint8)
-            comp = dict(m)
-            comp["segmentation"] = comp_seg
-            comp["bbox"] = [x, y, w, h]
-            comp["area"] = float(area)
-            meta = dict(m.get("meta", {}))
-            meta["split"] = True
-            meta["split_components"] = int(num_labels - 1)
-            comp["meta"] = meta
-            comps.append(comp)
-
-        if len(comps) <= 1:
-            out.append(m)
-        else:
-            if max_components is not None and len(comps) > int(max_components):
-                comps = sorted(comps, key=lambda z: z.get("area", 0), reverse=True)[: int(max_components)]
-            out.extend(comps)
-    return out
-
-
-
-# =========================
-#  Canvas/Image coordinate helpers 
-# =========================
-def _canvas_geometry(self):
-    """Return (cx, cy, new_w, new_h, W, H) for current drawn image box."""
-    if self._img_for_preview is None:
-        return None
-    H, W = self._img_for_preview.shape[:2]
-    cw = int(self.canvas.winfo_width())
-    ch = int(self.canvas.winfo_height())
-    fit = min(cw / max(1, W), ch / max(1, H))
-    scale = fit if getattr(self, "_fit_mode", True) else fit * getattr(self, "_zoom", 1.0)
-    new_w = max(1, int(W * scale))
-    new_h = max(1, int(H * scale))
-    cx, cy = cw // 2 + self._pan[0], ch // 2 + self._pan[1]
-    return cx, cy, new_w, new_h, W, H
-
-def _canvas_to_image_xy(self, x_canvas, y_canvas):
-    g = self._canvas_geometry()
-    if g is None:
-        return None
-    cx, cy, new_w, new_h, W, H = g
-    left  = cx - new_w // 2
-    top   = cy - new_h // 2
-    # map into the scaled image rect, then back to original pixels
-    x_rel = (x_canvas - left)
-    y_rel = (y_canvas - top)
-    if x_rel < 0 or y_rel < 0 or x_rel > new_w or y_rel > new_h:
-        return None
-    x_img = int(round(x_rel * (W / new_w)))
-    y_img = int(round(y_rel * (H / new_h)))
-    x_img = max(0, min(W - 1, x_img))
-    y_img = max(0, min(H - 1, y_img))
-    return x_img, y_img
-
-def _image_to_canvas_xy(self, x_img, y_img):
-    g = self._canvas_geometry()
-    if g is None:
-        return None
-    cx, cy, new_w, new_h, W, H = g
-    left  = cx - new_w // 2
-    top   = cy - new_h // 2
-    x_rel = x_img * (new_w / W)
-    y_rel = y_img * (new_h / H)
-    return int(left + x_rel), int(top + y_rel)
-
-
-def _clear_crop_overlay(self):
-    self._crop_rect_img = None
-    if self._crop_canvas_id:
-        try: self.canvas.delete(self._crop_canvas_id)
-        except Exception: pass
-    self._crop_canvas_id = None
-
-def _update_crop_buttons(self):
-    enabled = (self._crop_mode.get() and self._crop_rect_img is not None)
-    self._btn_crop_apply.configure(state="normal" if enabled else "disabled")
-    self._btn_crop_cancel.configure(state="normal" if self._crop_mode.get() else "disabled")
-
-
-# =========================
-# Crop interactions 
-# =========================
-def _crop_start(self, event):
-    if self._img_for_preview is None:
-        return
-    self._crop_start_canvas = (event.x, event.y)
-    # initialize selection at a single point
-    p = self._canvas_to_image_xy(event.x, event.y)
-    if p:
-        self._crop_rect_img = (*p, *p)
-        self._draw_crop_overlay()
-        self._update_crop_buttons()
-
-def _crop_drag(self, event):
-    if self._img_for_preview is None or self._crop_start_canvas is None:
-        return
-    p0 = self._canvas_to_image_xy(*self._crop_start_canvas)
-    p1 = self._canvas_to_image_xy(event.x, event.y)
-    if not p0 or not p1:
-        return
-    x0, y0 = p0; x1, y1 = p1
-    x1, x2 = sorted((x0, x1)); y1, y2 = sorted((y0, y1))
-    # avoid zero-size rects
-    if x2 - x1 < 2 or y2 - y1 < 2:
-        return
-    self._crop_rect_img = (x1, y1, x2, y2)
-    self._draw_crop_overlay()
-    self._update_crop_buttons()
-
-def _crop_end(self, event):
-    # nothing extra; selection already stored during drag
-    pass
-
-def _apply_crop(self):
-    """Commit crop to the working image. This *commits your current rotation*
-    by replacing img_orig with the cropped, rotated view and resetting angle to 0°."""
-    if not self._crop_rect_img or self._img_for_preview is None:
-        return
-    x1, y1, x2, y2 = self._crop_rect_img
-    # crop the *rotated* base so shapes stay consistent with what user saw
-    base = self._base_image()
-    if base is None:
-        return
-    x1 = max(0, min(base.shape[1]-1, x1))
-    x2 = max(0, min(base.shape[1],   x2))
-    y1 = max(0, min(base.shape[0]-1, y1))
-    y2 = max(0, min(base.shape[0],   y2))
-    if x2 <= x1+1 or y2 <= y1+1:
-        return
-
-    cropped = base[y1:y2, x1:x2, :].copy()
-
-    # commit: new "original"; reset rotation; clear masks/preview
-    self.img_orig = cropped
-    self.rot_angle.set(0.0)
-    self._draw_knob()
-    self.sr = None
-    self.lb.delete(0, tk.END)
-
-    # reset view and leave crop mode
-    self._clear_crop_overlay()
-    self._zoom_fit()
-    self._crop_mode.set(False)
-    self._bind_canvas_events()
-    self._update_crop_buttons()
-
-    # show it
-    self.img = self._base_image()
-    self.img_preview = None
-    self.show_image(self.img)
-
-def _cancel_crop(self):
-    self._clear_crop_overlay()
-    self._update_crop_buttons()
-    # keep crop mode toggled on/off as chosen; just clear selection
-
-
-# =========================
-# Enhancers
-# =========================
-
-def preprocess_for_edges(
-    img_rgb_uint8,
-    brightness=0, contrast=1.0,
-    use_unsharp=True, unsharp_kernel_size=9, unsharp_sigma=10.0, unsharp_amount=1.5,
-    use_laplacian=False,
-    gamma=None
-):
-    x = img_rgb_uint8.astype(np.uint8)
-
-    if brightness != 0 or contrast != 1.0:
-        x = cv2.addWeighted(x, contrast, np.zeros_like(x), 0, brightness)
-
-    if use_unsharp:
-        k = (int(unsharp_kernel_size), int(unsharp_kernel_size))
-        blur = cv2.GaussianBlur(x, k, unsharp_sigma)
-        x = cv2.addWeighted(x, unsharp_amount, blur, -(unsharp_amount - 1.0), 0)
-
-    if use_laplacian:
-        lap = cv2.Laplacian(cv2.cvtColor(x, cv2.COLOR_RGB2GRAY), cv2.CV_64F)
-        lap = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        x = np.dstack([lap, lap, lap])
-
-    if gamma is not None and gamma > 0:
-        tab = np.clip((np.arange(256) / 255.0) ** (1.0 / gamma) * 255.0, 0, 255).astype(np.uint8)
-        x = cv2.LUT(x, tab)
-
-    return np.ascontiguousarray(x)
-
-def enhance_leaf_edges_rgb(
-    img_rgb_uint8,
-    hsv_h_low=25, hsv_h_high=95, hsv_s_min=40, hsv_v_min=40,
-    clahe_clip=2.0, clahe_tiles=8,
-    bilateral_d=7, bilateral_sigma=50,
-    unsharp_amount=1.5, unsharp_sigma=10, unsharp_ksize=9,
-    sobel_blend=0.12
-):
-    x = img_rgb_uint8.astype(np.uint8)
-
-    hsv = cv2.cvtColor(x, cv2.COLOR_RGB2HSV)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-
-    green = (h >= hsv_h_low) & (h <= hsv_h_high) & (s >= hsv_s_min) & (v >= hsv_v_min)
-    green = cv2.morphologyEx(green.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1).astype(bool)
-
-    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(clahe_tiles, clahe_tiles))
-    v_clahe = clahe.apply(v)
-    v_eq = v.copy()
-    if green.any():
-        v_eq[green] = v_clahe[green]
-    else:
-        v_eq = v_clahe
-
-    hsv2 = hsv.copy(); hsv2[..., 2] = v_eq
-    rgb_eq = cv2.cvtColor(hsv2, cv2.COLOR_HSV2RGB)
-
-    rgb_bi = cv2.bilateralFilter(rgb_eq, d=int(bilateral_d), sigmaColor=bilateral_sigma, sigmaSpace=bilateral_sigma)
-
-    gray = cv2.cvtColor(rgb_bi, cv2.COLOR_RGB2GRAY)
-    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    sobel = cv2.normalize(cv2.magnitude(sx, sy), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    hsv3 = cv2.cvtColor(rgb_bi, cv2.COLOR_RGB2HSV)
-    hsv3[..., 2] = np.clip(hsv3[..., 2].astype(np.float32) + sobel_blend * sobel, 0, 255).astype(np.uint8)
-    rgb_edge = cv2.cvtColor(hsv3, cv2.COLOR_HSV2RGB)
-
-    blur = cv2.GaussianBlur(rgb_edge, (int(unsharp_ksize), int(unsharp_ksize)), unsharp_sigma)
-    sharp = cv2.addWeighted(rgb_edge, unsharp_amount, blur, -(unsharp_amount - 1.0), 0)
-
-    return np.ascontiguousarray(sharp)
-
-def flatten_background_whiten(img_rgb_uint8, val_min=200, sat_max=35, morph_open=3, morph_close=5):
-    hsv = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2HSV)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    bg = (v >= val_min) & (s <= sat_max)
-    if morph_open > 0:
-        k = np.ones((morph_open, morph_open), np.uint8)
-        bg = cv2.morphologyEx(bg.astype(np.uint8), cv2.MORPH_OPEN, k, iterations=1).astype(bool)
-    if morph_close > 0:
-        k = np.ones((morph_close, morph_close), np.uint8)
-        bg = cv2.morphologyEx(bg.astype(np.uint8), cv2.MORPH_CLOSE, k, iterations=1).astype(bool)
-
-    out = img_rgb_uint8.copy()
-    out[bg] = 255
-    return out
-
-
-# =========================
-# Advanced Enhancement Functions
-# =========================
-
-def compute_vegetation_indices(rgb):
-    """
-    Compute plant-specific vegetation indices from RGB.
-    Returns dict with ExG, GRVI, VARI, TGI, GLI as normalized uint8 images.
-    """
-    R = rgb[..., 0].astype(np.float32)
-    G = rgb[..., 1].astype(np.float32)
-    B = rgb[..., 2].astype(np.float32)
-
-    # Normalize to 0-1 range
-    r = R / 255.0
-    g = G / 255.0
-    b = B / 255.0
-
-    # Excess Green Index (ExG) - highlights green vegetation
-    ExG = 2*g - r - b
-
-    # Green-Red Vegetation Index (GRVI)
-    GRVI = (g - r) / (g + r + 1e-6)
-
-    # Visible Atmospherically Resistant Index (VARI)
-    VARI = (g - r) / (g + r - b + 1e-6)
-
-    # Triangular Greenness Index (TGI)
-    TGI = g - 0.39*r - 0.61*b
-
-    # Green Leaf Index (GLI)
-    GLI = (2*g - r - b) / (2*g + r + b + 1e-6)
-
-    # Normalize each to 0-255 uint8
-    def normalize_to_uint8(arr):
-        arr = np.clip(arr, np.percentile(arr, 1), np.percentile(arr, 99))
-        return cv2.normalize(arr, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    return {
-        'ExG': normalize_to_uint8(ExG),
-        'GRVI': normalize_to_uint8(GRVI),
-        'VARI': normalize_to_uint8(VARI),
-        'TGI': normalize_to_uint8(TGI),
-        'GLI': normalize_to_uint8(GLI),
-    }
-
-
-def enhance_with_vegetation_index(rgb, index_type='ExG', blend=0.3):
-    """
-    Enhance image by blending with a vegetation index.
-    index_type: 'ExG', 'GRVI', 'VARI', 'TGI', 'GLI'
-    blend: 0.0-1.0, how much of the index to blend in
-    """
-    indices = compute_vegetation_indices(rgb)
-    idx_img = indices.get(index_type, indices['ExG'])
-
-    # Convert index to 3-channel for blending
-    idx_rgb = cv2.cvtColor(idx_img, cv2.COLOR_GRAY2RGB)
-
-    # Blend with original
-    enhanced = cv2.addWeighted(rgb, 1.0 - blend, idx_rgb, blend, 0)
-    return np.clip(enhanced, 0, 255).astype(np.uint8)
-
-
-def denoise_nlm(rgb, h=10, template_size=7, search_size=21):
-    """
-    Non-local means denoising - preserves edges better than median/mean.
-    h: filter strength (higher = more denoising, 10 is good default)
-    template_size: should be odd, 7 is good
-    search_size: should be odd, 21 is good
-    """
-    # Ensure odd sizes
-    template_size = template_size if template_size % 2 == 1 else template_size + 1
-    search_size = search_size if search_size % 2 == 1 else search_size + 1
-    return cv2.fastNlMeansDenoisingColored(rgb, None, h, h, template_size, search_size)
-
-
-def single_scale_retinex(rgb, sigma=80):
-    """
-    Single-Scale Retinex - removes illumination effects, enhances details.
-    Good for uneven lighting conditions.
-    sigma: Gaussian blur sigma (higher = more illumination removal)
-    """
-    rgb_f = rgb.astype(np.float32) + 1.0
-    blur = cv2.GaussianBlur(rgb_f, (0, 0), sigma)
-    retinex = np.log10(rgb_f) - np.log10(blur + 1.0)
-
-    # Normalize each channel separately
-    result = np.zeros_like(rgb, dtype=np.uint8)
-    for c in range(3):
-        result[..., c] = cv2.normalize(retinex[..., c], None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return result
-
-
-def multi_scale_retinex(rgb, sigmas=(15, 80, 250), weights=None):
-    """
-    Multi-Scale Retinex with Color Restoration (MSRCR).
-    Combines multiple scales for better illumination correction.
-    sigmas: tuple of Gaussian sigmas for different scales
-    weights: optional weights for each scale (defaults to equal)
-    """
-    if weights is None:
-        weights = [1.0 / len(sigmas)] * len(sigmas)
-
-    rgb_f = rgb.astype(np.float32) + 1.0
-    log_rgb = np.log10(rgb_f)
-
-    msr = np.zeros_like(rgb_f)
-    for sigma, weight in zip(sigmas, weights):
-        blur = cv2.GaussianBlur(rgb_f, (0, 0), sigma)
-        msr += weight * (log_rgb - np.log10(blur + 1.0))
-
-    # Color restoration
-    intensity = np.mean(rgb_f, axis=2, keepdims=True)
-    color_restoration = np.log10(125.0 * rgb_f / (intensity + 1.0) + 1.0)
-    msr = msr * color_restoration
-
-    # Normalize
-    result = np.zeros_like(rgb, dtype=np.uint8)
-    for c in range(3):
-        result[..., c] = cv2.normalize(msr[..., c], None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return result
-
-
-def morphological_tophat(rgb, kernel_size=50):
-    """
-    Top-hat and Black-hat transform for illumination normalization.
-    Removes uneven background illumination.
-    kernel_size: size of structuring element (larger = removes larger variations)
-    """
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-
-    # Process each channel
-    result = np.zeros_like(rgb)
-    for c in range(3):
-        channel = rgb[..., c]
-        tophat = cv2.morphologyEx(channel, cv2.MORPH_TOPHAT, kernel)
-        blackhat = cv2.morphologyEx(channel, cv2.MORPH_BLACKHAT, kernel)
-        enhanced = cv2.add(channel, tophat)
-        enhanced = cv2.subtract(enhanced, blackhat)
-        result[..., c] = enhanced
-
-    return result
-
-
-def guided_filter_enhance(rgb, radius=8, eps=0.04):
-    """
-    Edge-preserving smoothing using guided filter.
-    Better than bilateral filter for preserving sharp edges.
-    radius: filter radius
-    eps: regularization (smaller = sharper edges)
-    """
-    try:
-        # Check if ximgproc is available
-        rgb_f = rgb.astype(np.float32) / 255.0
-        # Use green channel as guide (best for plants)
-        guide = rgb_f[..., 1]
-
-        filtered = np.zeros_like(rgb_f)
-        for c in range(3):
-            filtered[..., c] = cv2.ximgproc.guidedFilter(guide, rgb_f[..., c], radius, eps)
-
-        return (filtered * 255).clip(0, 255).astype(np.uint8)
-    except AttributeError:
-        # ximgproc not available, fall back to bilateral
-        return cv2.bilateralFilter(rgb, radius, eps * 1000, eps * 1000)
-
-
-def enhance_lab_green(rgb, l_factor=1.0, a_shift=-10, b_shift=0):
-    """
-    Enhance in LAB color space.
-    The 'a' channel is the red-green axis, so negative shift enhances green.
-    l_factor: luminance multiplier
-    a_shift: shift in a channel (negative = more green)
-    b_shift: shift in b channel (negative = more blue)
-    """
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-
-    # L channel: 0-255
-    lab[..., 0] = np.clip(lab[..., 0] * l_factor, 0, 255)
-
-    # a channel: 0-255, 128 is neutral (negative shift = more green)
-    lab[..., 1] = np.clip(lab[..., 1] + a_shift, 0, 255)
-
-    # b channel: 0-255, 128 is neutral (negative shift = more blue)
-    lab[..., 2] = np.clip(lab[..., 2] + b_shift, 0, 255)
-
-    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-
-def white_balance_grayworld(rgb):
-    """
-    Gray World white balance correction.
-    Assumes average color should be gray - corrects color cast.
-    Good for standardizing colors across different lighting conditions.
-    """
-    result = rgb.astype(np.float32)
-
-    # Calculate average for each channel
-    avg_r = np.mean(result[..., 0])
-    avg_g = np.mean(result[..., 1])
-    avg_b = np.mean(result[..., 2])
-
-    # Calculate overall average
-    avg_all = (avg_r + avg_g + avg_b) / 3.0
-
-    # Scale each channel
-    if avg_r > 0:
-        result[..., 0] = result[..., 0] * (avg_all / avg_r)
-    if avg_g > 0:
-        result[..., 1] = result[..., 1] * (avg_all / avg_g)
-    if avg_b > 0:
-        result[..., 2] = result[..., 2] * (avg_all / avg_b)
-
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def white_balance_max_white(rgb, percentile=99):
-    """
-    Max-White white balance - assumes brightest pixels should be white.
-    percentile: use this percentile as "white" (99 avoids outliers)
-    """
-    result = rgb.astype(np.float32)
-
-    for c in range(3):
-        max_val = np.percentile(result[..., c], percentile)
-        if max_val > 0:
-            result[..., c] = result[..., c] * (255.0 / max_val)
-
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def difference_of_gaussians(rgb, sigma1=1.0, sigma2=3.0, blend=0.3):
-    """
-    Difference of Gaussians - enhances edges, similar to biological vision.
-    sigma1: smaller sigma (detail)
-    sigma2: larger sigma (context)
-    blend: how much DoG to add to original
-    """
-    g1 = cv2.GaussianBlur(rgb.astype(np.float32), (0, 0), sigma1)
-    g2 = cv2.GaussianBlur(rgb.astype(np.float32), (0, 0), sigma2)
-
-    dog = g1 - g2
-
-    # Normalize DoG to visible range
-    dog = cv2.normalize(dog, None, -128, 128, cv2.NORM_MINMAX)
-
-    # Blend with original
-    enhanced = rgb.astype(np.float32) + blend * dog
-
-    return np.clip(enhanced, 0, 255).astype(np.uint8)
-
-
-def local_contrast_normalization(rgb, kernel_size=31):
-    """
-    Local contrast normalization - enhances local details.
-    Divides by local standard deviation.
-    kernel_size: size of local region (must be odd)
-    """
-    kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-
-    result = np.zeros_like(rgb, dtype=np.float32)
-
-    for c in range(3):
-        channel = rgb[..., c].astype(np.float32)
-
-        # Local mean
-        local_mean = cv2.GaussianBlur(channel, (kernel_size, kernel_size), 0)
-
-        # Local variance
-        local_sq_mean = cv2.GaussianBlur(channel**2, (kernel_size, kernel_size), 0)
-        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean**2, 0) + 1e-6)
-
-        # Normalize
-        normalized = (channel - local_mean) / local_std
-
-        # Scale back to 0-255
-        result[..., c] = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
-
-    return result.astype(np.uint8)
-
-
-def adaptive_gamma(rgb, clip_limit=2.0):
-    """
-    Adaptive gamma correction based on image histogram.
-    Automatically determines optimal gamma for the image.
-    """
-    # Convert to LAB
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    l_channel = lab[..., 0].astype(np.float32) / 255.0
-
-    # Calculate optimal gamma based on mean luminance
-    mean_l = np.mean(l_channel)
-
-    # If image is dark, use gamma < 1 to brighten; if bright, use gamma > 1
-    if mean_l < 0.5:
-        gamma = 0.5 + mean_l  # Range: 0.5-1.0 for dark images
-    else:
-        gamma = mean_l + 0.5  # Range: 1.0-1.5 for bright images
-
-    # Apply gamma to L channel
-    l_corrected = np.power(l_channel, 1.0 / gamma)
-    lab[..., 0] = (l_corrected * 255).clip(0, 255).astype(np.uint8)
-
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
-def shadow_highlight_correction(rgb, shadow_amount=0.3, highlight_amount=0.3):
-    """
-    Correct shadows and highlights separately.
-    shadow_amount: how much to lift shadows (0-1)
-    highlight_amount: how much to reduce highlights (0-1)
-    """
-    # Convert to LAB for luminance manipulation
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    l = lab[..., 0].astype(np.float32) / 255.0
-
-    # Shadow mask (dark areas)
-    shadow_mask = 1.0 - l
-    shadow_mask = np.power(shadow_mask, 2)  # Concentrate on darkest areas
-
-    # Highlight mask (bright areas)
-    highlight_mask = l
-    highlight_mask = np.power(highlight_mask, 2)  # Concentrate on brightest areas
-
-    # Apply corrections
-    l_corrected = l + shadow_amount * shadow_mask * (1.0 - l)
-    l_corrected = l_corrected - highlight_amount * highlight_mask * l_corrected
-
-    lab[..., 0] = (l_corrected * 255).clip(0, 255).astype(np.uint8)
-
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
-# =========================
-# SAM2 generator config
-# =========================
-
-def make_mask_generator(sam2_model):
-    return SAM2AutomaticMaskGenerator(
-        sam2_model,
-        points_per_side=32,
-        points_per_batch=32,
-        pred_iou_thresh=0.90,
-        stability_score_thresh=0.80,
-        crop_n_layers=1,
-        crop_overlap_ratio=0.30,
-        crop_n_points_downscale_factor=2,
-        box_nms_thresh=0.6,
-        min_mask_region_area=800,
-        use_m2m=True,
-        output_mode="binary_mask",
-    )
-
-
-# =========================
-# Config resolver
-# =========================
-
-from pathlib import Path
-from hydra import initialize_config_dir, compose
-from hydra.core.global_hydra import GlobalHydra
-
-def _compose_from_yaml(yaml_path: str):
-    """Compose a Hydra/OmegaConf config from a specific YAML file."""
-    conf_dir = str(Path(yaml_path).parent)
-    conf_name = Path(yaml_path).stem
-    GlobalHydra.instance().clear()
-    with initialize_config_dir(config_dir=conf_dir, job_name="sam2_gui", version_base=None):
-        return compose(config_name=conf_name)
-
-def _resolve_sam2_cfg(cfg_field, ckpt_path: str | None = None, fallback_short="sam2.1_hiera_l"):
-    """
-    Accepts:
-      - dict              -> converts to DictConfig
-      - DictConfig        -> returns as-is
-      - path to *.yaml    -> compose from that YAML
-      - directory path    -> tries common filenames inside it
-      - short name (str)  -> tries to find YAML near checkpoint or $SAM2_CONFIG_DIR; 
-                             otherwise returns the short name (so build_sam2 can resolve pkg configs).
-      - None              -> uses fallback_short
-    """
-    # 1) already structured
-    if cfg_field is None:
-        return fallback_short
-    if isinstance(cfg_field, DictConfig):
-        return cfg_field
-    if isinstance(cfg_field, dict):
-        return OmegaConf.create(cfg_field)
-
-    # 2) string-like
-    s = str(cfg_field).strip()
-    if not s:
-        return fallback_short
-
-    # YAML file?
-    if Path(s).is_file() and s.lower().endswith((".yaml", ".yml")):
-        return _compose_from_yaml(s)
-
-    # Config directory?
-    if Path(s).is_dir():
-        # common name in SAM2 repos
-        guess = Path(s) / "sam2.1_hiera_l.yaml"
-        if guess.exists():
-            return _compose_from_yaml(str(guess))
-        # otherwise pick any reasonable YAML in that folder
-        for y in sorted(Path(s).glob("*.y*ml")):
-            if "hiera" in y.stem:
-                return _compose_from_yaml(str(y))
-        # last resort: first yaml
-        cands = sorted(Path(s).glob("*.y*ml"))
-        if cands:
-            return _compose_from_yaml(str(cands[0]))
-
-    # Short name → search typical places (near ckpt or $SAM2_CONFIG_DIR)
-    guesses = []
-    env_dir = os.environ.get("SAM2_CONFIG_DIR")
-    if env_dir:
-        guesses += [str(Path(env_dir) / "sam2.1"), env_dir]
-    if ckpt_path:
-        ck = Path(ckpt_path)
-        repo_root = ck.parent.parent if ck.suffix == ".pt" else ck.parent
-        guesses += [str(repo_root / "configs" / "sam2.1"), str(repo_root / "configs")]
-    for d in guesses:
-        y = Path(d) / f"{s}.yaml"
-        if y.exists():
-            return _compose_from_yaml(str(y))
-
-    # Give up → let build_sam2 resolve package configs by short name
-    return s
-
-
-
-# =========================
-# GUI
-# =========================
-
-@dataclass
-class SegResult:
-    masks: list
-    img_color: np.ndarray
-    img_seg: np.ndarray
-    rotate_applied: bool
-
-
-class ToolTip:
-    """Modern tooltip with fade-in animation and rounded corners."""
-    def __init__(self, widget, text, delay=400):
-        self.widget = widget
-        self.text = text
-        self.delay = delay
-        self.tip_window = None
-        self.id = None
-        self.alpha = 0.0
-        widget.bind("<Enter>", self._schedule)
-        widget.bind("<Leave>", self._hide)
-        widget.bind("<ButtonPress>", self._hide)
-
-    def _schedule(self, event=None):
-        self._hide()
-        self.id = self.widget.after(self.delay, self._show)
-
-    def _show(self):
-        if self.tip_window:
-            return
-        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-
-        self.tip_window = tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_attributes("-topmost", True)
-        try:
-            tw.wm_attributes("-alpha", 0.0)
-        except Exception:
-            pass
-
-        # Tooltip styling
-        frame = tk.Frame(tw, bg="#1a1a2e", bd=0, relief="flat")
-        frame.pack()
-
-        label = tk.Label(
-            frame,
-            text=self.text,
-            bg="#1a1a2e",
-            fg="#eaf4f4",
-            font=("Helvetica", 10),
-            padx=10,
-            pady=6,
-        )
-        label.pack()
-
-        tw.update_idletasks()
-        tw_width = tw.winfo_reqwidth()
-        x = x - tw_width // 2
-        tw.wm_geometry(f"+{x}+{y}")
-
-        self._fade_in()
-
-    def _fade_in(self):
-        if not self.tip_window:
-            return
-        self.alpha = min(1.0, self.alpha + 0.15)
-        try:
-            self.tip_window.wm_attributes("-alpha", self.alpha)
-        except Exception:
-            pass
-        if self.alpha < 1.0:
-            self.widget.after(20, self._fade_in)
-
-    def _hide(self, event=None):
-        if self.id:
-            self.widget.after_cancel(self.id)
-            self.id = None
-        if self.tip_window:
-            self.tip_window.destroy()
-            self.tip_window = None
-        self.alpha = 0.0
-
-
-class AnimatedSpinner:
-    """Animated loading spinner overlay."""
-    def __init__(self, parent, colors):
-        self.parent = parent
-        self.colors = colors
-        self.canvas = None
-        self.angle = 0
-        self.animating = False
-        self.label_text = "Processing..."
-
-    def show(self, text="Processing..."):
-        self.label_text = text
-        if self.canvas:
-            return
-
-        self.canvas = tk.Canvas(
-            self.parent,
-            bg=self.colors['canvas_bg'],
-            highlightthickness=0,
-        )
-        self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
-
-        # Semi-transparent overlay
-        self.canvas.create_rectangle(
-            0, 0, 2000, 2000,
-            fill=self.colors['bg_dark'],
-            stipple="gray50",
-            tags="overlay"
-        )
-
-        self.animating = True
-        self._draw_spinner()
-
-    def _draw_spinner(self):
-        if not self.canvas or not self.animating:
-            return
-
-        self.canvas.delete("spinner")
-        self.canvas.delete("text")
-
-        cx = self.canvas.winfo_width() // 2
-        cy = self.canvas.winfo_height() // 2
-
-        if cx < 10:
-            cx, cy = 200, 150
-
-        r = 30
-        # Draw arc segments
-        for i in range(8):
-            start_angle = self.angle + i * 45
-            alpha = 1.0 - (i * 0.12)
-            color = self._blend_color(self.colors['accent'], self.colors['bg_dark'], alpha)
-            self.canvas.create_arc(
-                cx - r, cy - r, cx + r, cy + r,
-                start=start_angle, extent=30,
-                style="arc", width=4, outline=color,
-                tags="spinner"
-            )
-
-        # Text below spinner
-        self.canvas.create_text(
-            cx, cy + r + 25,
-            text=self.label_text,
-            fill=self.colors['text_light'],
-            font=("Helvetica", 12, "bold"),
-            tags="text"
-        )
-
-        self.angle = (self.angle + 15) % 360
-        self.parent.after(50, self._draw_spinner)
-
-    def _blend_color(self, c1, c2, alpha):
-        """Blend two hex colors."""
-        try:
-            r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
-            r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
-            r = int(r1 * alpha + r2 * (1 - alpha))
-            g = int(g1 * alpha + g2 * (1 - alpha))
-            b = int(b1 * alpha + b2 * (1 - alpha))
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except Exception:
-            return c1
-
-    def hide(self):
-        self.animating = False
-        if self.canvas:
-            self.canvas.destroy()
-            self.canvas = None
-
-
 class LeafSegmenterGUI:
     def __init__(self, root):
         self.root = root
         root.title("🌿 Leaf Segmenter — SAM2 Plant Phenotyping Tool")
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # COLOR THEME - Modern Plant-inspired palette
-        # ═══════════════════════════════════════════════════════════════════════
-        self.colors = {
-            'bg_dark': '#1a2f1a',       # Deep forest - main background
-            'bg_medium': '#2d4a2d',     # Forest green - panels
-            'bg_light': '#4a7c4a',      # Sage green - sections
-            'bg_pale': '#e8f5e8',       # Mint cream - inputs/entries
-            'accent': '#4caf50',        # Vibrant green - buttons
-            'accent_hover': '#66bb6a',  # Lighter green - hover
-            'accent_active': '#81c784', # Active state
-            'text_light': '#f1f8e9',    # Warm white text on dark
-            'text_dark': '#1b5e20',     # Deep green text on light
-            'canvas_bg': '#0d1f0d',     # Dark forest - canvas background
-            'warning': '#ff9800',       # Orange for warnings
-            'success': '#4caf50',       # Green for success
-            'error': '#f44336',         # Red for errors
-            'info': '#2196f3',          # Blue for info
-            'border': '#3d5c3d',        # Subtle border color
-            'highlight': '#a5d6a7',     # Highlight color
-        }
+        # ── Colors + icons come from app_visuals.py ───────────────────────────
+        self.colors = COLORS
+        self.icons  = ICONS
 
-        # Unicode icons for sections
-        self.icons = {
-            'model': '🧠',
-            'image': '🖼️',
-            'enhance': '✨',
-            'sam': '🎯',
-            'phenotype': '📊',
-            'action': '⚡',
-            'masks': '🎭',
-            'preview': '👁️',
-            'training': '🔬',
-            'folder': '📁',
-            'save': '💾',
-            'load': '📂',
-            'segment': '✂️',
-            'success': '✓',
-            'warning': '⚠️',
-            'info': 'ℹ️',
-        }
-        c = self.colors
-
-        # Configure root window
-        root.configure(bg=c['bg_dark'])
-
-        # Configure ttk styles
-        style = ttk.Style()
-        style.theme_use('clam')  # 'clam' theme allows more customization
-
-        # Main frame style
-        style.configure('TFrame', background=c['bg_dark'])
-        style.configure('TLabel', background=c['bg_dark'], foreground=c['text_light'])
-        style.configure('TCheckbutton', background=c['bg_dark'], foreground=c['text_light'])
-        style.configure('TRadiobutton', background=c['bg_dark'], foreground=c['text_light'])
-
-        # LabelFrame styles for different sections
-        style.configure('TLabelframe', background=c['bg_medium'], bordercolor=c['bg_light'])
-        style.configure('TLabelframe.Label', background=c['bg_medium'], foreground=c['text_light'],
-                       font=('Helvetica', 11, 'bold'))
-
-        # Special styles for different panel types
-        style.configure('Model.TLabelframe', background=c['bg_medium'])
-        style.configure('Model.TLabelframe.Label', background=c['bg_medium'], foreground=c['text_light'])
-
-        style.configure('Options.TLabelframe', background=c['bg_medium'])
-        style.configure('Options.TLabelframe.Label', background=c['bg_medium'], foreground=c['text_light'],
-                       font=('Helvetica', 10, 'bold'))
-
-        style.configure('Preview.TLabelframe', background=c['bg_medium'])
-        style.configure('Preview.TLabelframe.Label', background=c['bg_medium'], foreground=c['text_light'])
-
-        style.configure('Masks.TLabelframe', background=c['bg_light'])
-        style.configure('Masks.TLabelframe.Label', background=c['bg_light'], foreground=c['text_dark'])
-
-        style.configure('Training.TLabelframe', background=c['bg_pale'])
-        style.configure('Training.TLabelframe.Label', background=c['bg_pale'], foreground=c['text_dark'],
-                       font=('Helvetica', 11, 'bold'))
-
-        # Button styles - Modern flat design
-        style.configure('TButton',
-                       background=c['accent'],
-                       foreground=c['text_light'],
-                       borderwidth=0,
-                       focuscolor=c['accent'],
-                       padding=(12, 6),
-                       font=('Helvetica', 10))
-        style.map('TButton',
-                 background=[('active', c['accent_hover']), ('pressed', c['accent_active'])],
-                 foreground=[('active', c['text_dark']), ('pressed', c['text_dark'])])
-
-        # Accent button (for important actions) - Bolder styling
-        style.configure('Accent.TButton',
-                       background=c['accent'],
-                       foreground=c['text_light'],
-                       font=('Helvetica', 11, 'bold'),
-                       padding=(14, 8))
-        style.map('Accent.TButton',
-                 background=[('active', c['accent_hover']), ('pressed', c['accent_active'])],
-                 foreground=[('active', c['text_dark'])])
-
-        # Secondary button style (less prominent)
-        style.configure('Secondary.TButton',
-                       background=c['bg_medium'],
-                       foreground=c['text_light'],
-                       font=('Helvetica', 10),
-                       padding=(10, 5))
-        style.map('Secondary.TButton',
-                 background=[('active', c['bg_light'])],
-                 foreground=[('active', c['text_light'])])
-
-        # Icon button style (small square buttons)
-        style.configure('Icon.TButton',
-                       background=c['bg_medium'],
-                       foreground=c['text_light'],
-                       font=('Helvetica', 12),
-                       padding=(6, 4),
-                       width=3)
-        style.map('Icon.TButton',
-                 background=[('active', c['accent'])])
-
-        # Entry style
-        style.configure('TEntry',
-                       fieldbackground=c['bg_pale'],
-                       foreground=c['text_dark'],
-                       insertcolor=c['text_dark'])
-
-        # Combobox style
-        style.configure('TCombobox',
-                       fieldbackground=c['bg_pale'],
-                       background=c['bg_pale'],
-                       foreground=c['text_dark'])
-
-        # Scale/slider style
-        style.configure('TScale',
-                       background=c['bg_medium'],
-                       troughcolor=c['bg_dark'])
-
-        # Scrollbar style
-        style.configure('TScrollbar',
-                       background=c['bg_light'],
-                       troughcolor=c['bg_dark'],
-                       bordercolor=c['bg_medium'],
-                       arrowcolor=c['text_light'])
-
-        # Spinbox style
-        style.configure('TSpinbox',
-                       fieldbackground=c['bg_pale'],
-                       foreground=c['text_dark'])
-
-        # PanedWindow style
-        style.configure('TPanedwindow', background=c['bg_dark'])
-
-        # Separator style
-        style.configure('TSeparator', background=c['bg_light'])
-
-        # Notebook style (if used)
-        style.configure('TNotebook', background=c['bg_dark'])
-        style.configure('TNotebook.Tab', background=c['bg_medium'], foreground=c['text_light'])
+        # Apply the full theme (all ttk styles) in one call
+        apply_theme(root)
+        root.configure(bg=COLORS['bg_dark'])
 
         self.img_path = None
         self.img = None
@@ -1679,55 +233,150 @@ class LeafSegmenterGUI:
             self._left_canvas.itemconfig(self._left_canvas_window, width=e.width)
         self._left_canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Enable mousewheel scrolling on left panel
-        def _on_left_mousewheel(e):
-            # macOS uses different delta values than Windows
+        # ── Global scroll router ─────────────────────────────────────────────
+        # One bind_all handler catches every scroll event in the app and
+        # routes it to the nearest *content-scrollable* ancestor of the
+        # widget under the mouse.  "Content-scrollable" means the widget
+        # has a yscrollcommand set — this excludes the image-preview canvas
+        # (which has no scrollbar) while including the left-panel canvas,
+        # training-tab canvases, and the masks listbox.
+
+        def _delta_to_units(e):
             if e.delta:
-                # macOS: delta is typically 1 or -1, Windows: delta is 120 or -120
-                if abs(e.delta) > 10:
-                    scroll_amount = int(-1 * (e.delta / 120))
-                else:
-                    scroll_amount = -1 * e.delta
-            else:
-                scroll_amount = -1
-            self._left_canvas.yview_scroll(scroll_amount, "units")
-            return "break"
-        def _on_left_scroll_linux(e, direction):
-            self._left_canvas.yview_scroll(direction, "units")
-            return "break"
+                return int(-1 * (e.delta / 120)) if abs(e.delta) > 10 else -e.delta
+            return 0
 
-        # Recursive function to bind scrolling to all children
-        def _bind_left_scroll_recursive(widget):
-            widget.bind("<MouseWheel>", _on_left_mousewheel)
-            widget.bind("<Button-4>", lambda e: _on_left_scroll_linux(e, -1))
-            widget.bind("<Button-5>", lambda e: _on_left_scroll_linux(e, 1))
-            for child in widget.winfo_children():
-                _bind_left_scroll_recursive(child)
+        def _has_yscroll(w):
+            try:
+                cls = w.winfo_class()
+                if cls == "Listbox":
+                    return True
+                if cls in ("Canvas", "Text"):
+                    return bool(w.configure("yscrollcommand")[4])
+            except Exception:
+                pass
+            return False
 
-        # Bind to canvas
-        self._left_canvas.bind("<MouseWheel>", _on_left_mousewheel)
-        self._left_canvas.bind("<Button-4>", lambda e: _on_left_scroll_linux(e, -1))
-        self._left_canvas.bind("<Button-5>", lambda e: _on_left_scroll_linux(e, 1))
+        def _find_scrollable(widget):
+            try:
+                w = widget
+                while w:
+                    if _has_yscroll(w):
+                        return w
+                    pname = w.winfo_parent()
+                    if not pname:
+                        break
+                    w = w.nametowidget(pname)
+            except Exception:
+                pass
+            return None
 
-        # Store the binding function to call after building all frames
-        self._bind_left_scroll = lambda: _bind_left_scroll_recursive(self.left_panel)
+        def _global_scroll(e):
+            units = _delta_to_units(e)
+            if units == 0:
+                return
+            target = _find_scrollable(e.widget)
+            if target:
+                target.yview_scroll(units, "units")
+                return "break"
+
+        def _global_scroll_linux(e, direction):
+            target = _find_scrollable(e.widget)
+            if target:
+                target.yview_scroll(direction, "units")
+                return "break"
+
+        root.bind_all("<MouseWheel>", _global_scroll)
+        root.bind_all("<Button-4>",   lambda e: _global_scroll_linux(e, -1))
+        root.bind_all("<Button-5>",   lambda e: _global_scroll_linux(e,  1))
+
+        # no-op — kept so later self._bind_left_scroll() calls don't crash
+        self._bind_left_scroll = lambda: None
+
+        # ── Undo stack ────────────────────────────────────────────────────────
+        # Each entry is a deep-copy snapshot of self.sr.masks taken just
+        # before a destructive operation. Max 50 states kept.
+        self._undo_stack: list = []
+        self._undo_max: int = 50
 
         # ═══════════════════════════════════════════════════════════════════════
-        # RIGHT PANEL: Preview (top) + Masks (bottom) in a PanedWindow
+        # RIGHT PANEL: scrollable canvas + vertical PanedWindow with 3 panes:
+        #   1. Preview   (draggable)
+        #   2. Masks     (draggable)
+        #   3. Color Filter (draggable)
+        # A scrollbar on the right lets you reach all three even at small sizes.
         # ═══════════════════════════════════════════════════════════════════════
-        self.right_panel = ttk.PanedWindow(main_top, orient="vertical")
-        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=6)
+
+        # Container holds [canvas | scrollbar] side by side
+        _rc = tk.Frame(main_top, bg=self.colors["bg_dark"])
+        _rc.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=6)
+        _rc.grid_rowconfigure(0, weight=1)
+        _rc.grid_columnconfigure(0, weight=1)
+        _rc.grid_columnconfigure(1, weight=0)
+
+        # The canvas is what scrolls
+        self._right_scroll_canvas = tk.Canvas(
+            _rc, highlightthickness=0, bg=self.colors["bg_dark"])
+        self._right_scrollbar = ttk.Scrollbar(
+            _rc, orient="vertical",
+            command=self._right_scroll_canvas.yview)
+        self._right_scroll_canvas.configure(
+            yscrollcommand=self._right_scrollbar.set)
+        self._right_scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self._right_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Inner frame inside the canvas — the PanedWindow lives here
+        self._right_inner = ttk.Frame(self._right_scroll_canvas)
+        self._right_win_id = self._right_scroll_canvas.create_window(
+            (0, 0), window=self._right_inner, anchor="nw")
+
+        # Keep inner frame width = canvas width
+        def _rc_resize(e):
+            self._right_scroll_canvas.itemconfig(
+                self._right_win_id, width=e.width)
+        self._right_scroll_canvas.bind("<Configure>", _rc_resize)
+
+        # Update scroll region whenever inner frame changes size
+        def _rc_inner_configure(e):
+            self._right_scroll_canvas.configure(
+                scrollregion=self._right_scroll_canvas.bbox("all"))
+        self._right_inner.bind("<Configure>", _rc_inner_configure)
+
+        # PanedWindow with 3 draggable panes
+        self.right_panel = ttk.PanedWindow(self._right_inner, orient="vertical")
+        self.right_panel.pack(fill="both", expand=True)
 
         # Model type selection variables (must be defined before make_model_frame)
-        self.model_type_var = tk.StringVar(value="sam2")  # "sam2" or "tip"
-        self.tip_model_path_var = tk.StringVar(value="")  # Path to tip model .pth
+        self.model_type_var = tk.StringVar(value="sam2")
+        self.tip_model_path_var = tk.StringVar(value="")
 
         # Build the frames
         self.make_model_frame(self.left_panel)
-        self._on_model_type_change()  # Initialize visibility (show SAM2, hide Custom Model)
+        self._on_model_type_change()
         self.make_options_frame(self.left_panel)
         self.make_preview_frame(self.right_panel)
         self.make_masks_frame(self.right_panel)
+
+        # ── Color Filter — third pane (draggable like the others) ─────────────
+        self._cf_pane = ttk.LabelFrame(
+            self.right_panel,
+            text="  🎨 Color Filter  ",
+            padding=(6, 4))
+        self.right_panel.add(self._cf_pane, weight=1)
+        color_filter.attach(self, self._cf_pane)
+
+        # Give each pane a sensible default height after first layout
+        def _set_initial_sash(*_):
+            try:
+                total = self._right_scroll_canvas.winfo_height()
+                if total < 100:
+                    total = 700
+                # Preview gets ~50%, Masks ~30%, Color Filter ~20%
+                self.right_panel.sashpos(0, int(total * 0.50))
+                self.right_panel.sashpos(1, int(total * 0.80))
+            except Exception:
+                pass
+        self.root.after(200, _set_initial_sash)
 
         # Bind scrolling to all left panel children (must be done after frames are built)
         self._bind_left_scroll()
@@ -1827,7 +476,7 @@ class LeafSegmenterGUI:
         self.make_status_bar(root)
 
         # Initialize the animated spinner
-        self._spinner = AnimatedSpinner(root, self.colors)
+        self._spinner = AnimatedSpinner(root)
 
         # click-to-pick editing state
         self._edit_mode = tk.StringVar(value="none")  # 'none' | 'deselect' | 'select'
@@ -2002,6 +651,22 @@ class LeafSegmenterGUI:
         self.spin_angle.bind("<Return>", lambda e: self._angle_from_spin())
         self.spin_angle.bind("<FocusOut>", lambda e: self._angle_from_spin())
         self._draw_knob()
+
+        # Rotation preset buttons
+        preset_row = ttk.Frame(sec1)
+        preset_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(preset_row, text="Quick:").pack(side="left", padx=(0, 6))
+        for label, angle in [
+            ("90°", 90), ("180°", 180), ("270°", 270),
+            ("-90°", -90), ("45°", 45), ("-45°", -45),
+        ]:
+            btn = ttk.Button(
+                preset_row, text=label, width=4,
+                command=lambda a=angle: self._set_angle(a),
+                style="Icon.TButton",
+            )
+            btn.pack(side="left", padx=(0, 2))
+            ToolTip(btn, f"Set rotation to {label}")
 
         # ═══════════════════════════════════════════════════════════════════════
         # SECTION 2: Image Enhancement (Redesigned)
@@ -2370,29 +1035,95 @@ class LeafSegmenterGUI:
         self.m_use_m2m          = tk.BooleanVar(value=True)
         self.m_output_mode      = tk.StringVar(value="binary_mask")
 
-        # SAM2 params in clean rows
+        # SAM2 params — each label and entry gets a hover tooltip
+        _SAM_TIPS = {
+            "pts/side": (
+                "points_per_side — grid density of prompt points.\n"
+                "Higher = more mask proposals, slower segmentation.\n"
+                "Good range: 16–64. Try 32 for dense rosettes."
+            ),
+            "pts/batch": (
+                "points_per_batch — how many prompt points are processed\n"
+                "together. Higher uses more VRAM but is faster overall.\n"
+                "Lower if you get out-of-memory errors. Default: 16."
+            ),
+            "IoU thresh": (
+                "pred_iou_thresh — model's own quality score cutoff.\n"
+                "Higher (0.85–0.95) = only confident masks kept, fewer but cleaner.\n"
+                "Lower (0.5–0.7) = more masks found, more noise. Default: 0.90."
+            ),
+            "Stability": (
+                "stability_score_thresh — rejects masks that change shape\n"
+                "under small input perturbations (i.e. wobbly / uncertain masks).\n"
+                "Lower this if thin or low-contrast leaves keep vanishing."
+            ),
+            "Crop layers": (
+                "crop_n_layers — number of multi-scale crop passes.\n"
+                "0 = single pass. 1+ = also segments zoomed-in crops.\n"
+                "Use 1–2 to catch small leaves; costs extra time."
+            ),
+            "Overlap": (
+                "crop_overlap_ratio — how much adjacent crops overlap (0–1).\n"
+                "More overlap reduces split masks at crop boundaries\n"
+                "but makes segmentation slower. Default: 0.30."
+            ),
+            "NMS thresh": (
+                "box_nms_thresh — IoU threshold for suppressing duplicate masks.\n"
+                "Lower = more aggressive deduplication (fewer overlapping masks).\n"
+                "Raise if touching leaves are incorrectly merged. Default: 0.60."
+            ),
+            "Min area": (
+                "min_mask_region_area — drop masks smaller than this (px²).\n"
+                "Removes small noise blobs. Raise for noisy images,\n"
+                "lower if small seedlings are being missed. Default: 800."
+            ),
+            "use_m2m": (
+                "use_m2m — extra mask-to-mask refinement pass.\n"
+                "Improves boundary quality, especially where leaves overlap.\n"
+                "Slightly slower. Recommended to keep ON."
+            ),
+            "Output": (
+                "output_mode — format of the returned mask data.\n"
+                "'binary_mask' = boolean numpy array (best for PNG export).\n"
+                "Other modes (coco_rle etc.) are for external annotation tools."
+            ),
+        }
+
         sam_params = [
-            [("pts/side", self.m_points_per_side), ("pts/batch", self.m_points_per_batch)],
-            [("IoU thresh", self.m_pred_iou_thresh), ("Stability", self.m_stability_score_thresh)],
-            [("Crop layers", self.m_crop_n_layers), ("Overlap", self.m_crop_overlap_ratio)],
-            [("NMS thresh", self.m_box_nms_thresh), ("Min area", self.m_min_mask_region_area)],
+            [("pts/side",    self.m_points_per_side),  ("pts/batch", self.m_points_per_batch)],
+            [("IoU thresh",  self.m_pred_iou_thresh),  ("Stability", self.m_stability_score_thresh)],
+            [("Crop layers", self.m_crop_n_layers),    ("Overlap",   self.m_crop_overlap_ratio)],
+            [("NMS thresh",  self.m_box_nms_thresh),   ("Min area",  self.m_min_mask_region_area)],
         ]
 
         for row_data in sam_params:
             row = ttk.Frame(sec3)
             row.pack(fill="x", pady=1)
             for lbl, var in row_data:
-                ttk.Label(row, text=lbl, width=10).pack(side="left")
-                ttk.Entry(row, width=6, textvariable=var).pack(side="left", padx=(0, 12))
+                lbl_w = ttk.Label(row, text=lbl, width=10)
+                lbl_w.pack(side="left")
+                ent_w = ttk.Entry(row, width=6, textvariable=var)
+                ent_w.pack(side="left", padx=(0, 12))
+                if lbl in _SAM_TIPS:
+                    ToolTip(lbl_w, _SAM_TIPS[lbl])
+                    ToolTip(ent_w, _SAM_TIPS[lbl])
 
-        # Checkbox row
+        # Checkbox + output row
         opt_row = ttk.Frame(sec3)
         opt_row.pack(fill="x", pady=(4, 0))
-        ttk.Checkbutton(opt_row, text="use_m2m", variable=self.m_use_m2m).pack(side="left")
-        ttk.Label(opt_row, text="Output:").pack(side="left", padx=(12, 4))
-        ttk.Combobox(opt_row, width=12, state="readonly", textvariable=self.m_output_mode,
-                     values=("binary_mask", "coco_rle", "uncompressed_rle", "polygons")).pack(side="left")
-        ttk.Button(opt_row, text="?", width=2, command=self.explain_mask_params).pack(side="left", padx=(8, 0))
+        chk_m2m = ttk.Checkbutton(opt_row, text="use_m2m", variable=self.m_use_m2m)
+        chk_m2m.pack(side="left")
+        ToolTip(chk_m2m, _SAM_TIPS["use_m2m"])
+
+        out_lbl = ttk.Label(opt_row, text="Output:")
+        out_lbl.pack(side="left", padx=(12, 4))
+        out_cb = ttk.Combobox(opt_row, width=12, state="readonly",
+                              textvariable=self.m_output_mode,
+                              values=("binary_mask", "coco_rle",
+                                      "uncompressed_rle", "polygons"))
+        out_cb.pack(side="left")
+        ToolTip(out_lbl, _SAM_TIPS["Output"])
+        ToolTip(out_cb,  _SAM_TIPS["Output"])
 
         # ═══════════════════════════════════════════════════════════════════════
         # SECTION 5: Phenotypes
@@ -2742,583 +1473,42 @@ class LeafSegmenterGUI:
             canvas.itemconfig(canvas_window, width=e.width)
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mousewheel scrolling
-        def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            return "break"
-        def _on_scroll_linux(e, direction):
-            canvas.yview_scroll(direction, "units")
-            return "break"
-
-        canvas.bind("<MouseWheel>", _on_mousewheel)
-        canvas.bind("<Button-4>", lambda e: _on_scroll_linux(e, -1))
-        canvas.bind("<Button-5>", lambda e: _on_scroll_linux(e, 1))
-        inner.bind("<MouseWheel>", _on_mousewheel)
-        inner.bind("<Button-4>", lambda e: _on_scroll_linux(e, -1))
-        inner.bind("<Button-5>", lambda e: _on_scroll_linux(e, 1))
-
-        # Bind to all children recursively for better scroll support
-        def _bind_scroll_to_children(widget):
-            widget.bind("<MouseWheel>", _on_mousewheel)
-            widget.bind("<Button-4>", lambda e: _on_scroll_linux(e, -1))
-            widget.bind("<Button-5>", lambda e: _on_scroll_linux(e, 1))
-            for child in widget.winfo_children():
-                _bind_scroll_to_children(child)
-
-        # Store the binding function so we can call it after adding widgets
-        inner._bind_scroll = lambda: _bind_scroll_to_children(inner)
+        # Scrolling is handled globally by root.bind_all in __init__.
+        # _bind_scroll is kept as a no-op so existing call sites don't crash.
+        inner._bind_scroll = lambda: None
 
         return inner
 
     def make_training_frame(self, parent):
-        """Create training panel with tabs: Train Custom Model and Shape Completion."""
-        tf = ttk.LabelFrame(parent, text=f"  {self.icons['training']} Training  ", padding=(10, 5))
+        """Build the Training panel — each tab is in its own module."""
+        tf = ttk.LabelFrame(parent,
+                            text=f"  {self.icons['training']} Training  ",
+                            padding=(10, 5))
 
-        # Create notebook for tabs
         notebook = ttk.Notebook(tf)
         notebook.pack(fill="both", expand=True)
 
-        # ════════════════════════════════════════════════════════════════════
-        # TAB 1: Train Custom Model (formerly Target Segment)
-        # ════════════════════════════════════════════════════════════════════
+        # ── Tab 1: Train Custom Model ─────────────────────────────────────────
         tab1 = self._make_scrollable_tab(notebook, "  Train Custom Model  ")
-
-        desc1 = ttk.Label(tab1, text="Train a custom segmentation model (no SAM needed at inference).\n"
-                                     "Collect masks, train the model, then use it directly for segmentation.",
-                          wraplength=700, justify="left")
-        desc1.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-        r = 1
-        ttk.Label(tab1, text="Dataset folder:").grid(row=r, column=0, sticky="e", padx=(0,4))
-        ttk.Entry(tab1, textvariable=self.target_root_var, width=50).grid(row=r, column=1, sticky="ew", padx=4)
-        ttk.Button(tab1, text="Choose...", command=self._pick_target_root).grid(row=r, column=2)
-        tab1.grid_columnconfigure(1, weight=1)
-
-        r += 1
-        self.target_msg = ttk.Label(tab1, text="0 examples", anchor="w")
-        self.target_msg.grid(row=r, column=0, columnspan=2, sticky="w")
-        ttk.Checkbutton(tab1, text="Resume from existing model",
-                        variable=self.target_resume_var).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        tbar = ttk.Frame(tab1); tbar.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2,4))
-        ttk.Button(tbar, text="Add selected masks as target", command=self._add_current_to_target).pack(side="left")
-        ttk.Button(tbar, text="Mark image as NO target", command=self._add_negative_target).pack(side="left", padx=(8,0))
-        ttk.Button(tbar, text="Open dataset folder", command=self._open_target_root).pack(side="left", padx=(8,0))
-        ttk.Button(tbar, text="Scan dataset", command=self._scan_target_dataset).pack(side="left", padx=(8,0))
-        ttk.Button(tbar, text="Clear dataset", command=self._clear_target_set).pack(side="left", padx=(8,0))
-
-        # --- training params
-        r += 1
-        grid1 = ttk.Frame(tab1); grid1.grid(row=r, column=0, columnspan=3, sticky="ew")
-        ttk.Label(grid1, text="Save to (.pth)").grid(row=0, column=0, sticky="e")
-        ttk.Entry(grid1, textvariable=self.target_out_var, width=48).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(grid1, text="...", command=lambda: self._browse_save_into(self.target_out_var, default_ext=".pth")).grid(row=0, column=2)
-
-        ttk.Label(grid1, text="Steps").grid(row=1, column=0, sticky="e")
-        ttk.Spinbox(grid1, from_=100, to=200000, increment=100, textvariable=self.target_steps_var, width=10).grid(row=1, column=1, sticky="w", padx=4)
-        ttk.Label(grid1, text="LR").grid(row=1, column=2, sticky="e")
-        ttk.Entry(grid1, textvariable=self.target_lr_var, width=10).grid(row=1, column=3, sticky="w", padx=4)
-
-        ttk.Label(grid1, text="Image size").grid(row=2, column=0, sticky="e")
-        ttk.Spinbox(grid1, from_=256, to=2048, increment=128, textvariable=self.target_size_var, width=10).grid(row=2, column=1, sticky="w", padx=4)
-        ttk.Label(grid1, text="Device").grid(row=2, column=2, sticky="e")
-        ttk.Combobox(grid1, textvariable=self.target_device_var, values=["mps", "cuda", "cpu"], width=8).grid(row=2, column=3, sticky="w", padx=4)
-
-        ttk.Label(grid1, text="Batch size").grid(row=3, column=0, sticky="e")
-        ttk.Spinbox(grid1, from_=1, to=32, increment=1, textvariable=self.target_batch_var, width=8).grid(row=3, column=1, sticky="w", padx=4)
-        ttk.Label(grid1, text="Model").grid(row=3, column=2, sticky="e")
-        ttk.Combobox(grid1, textvariable=self.target_arch_var, values=["unet_resnet18", "unet_small"], width=14)\
-            .grid(row=3, column=3, sticky="w", padx=4)
-        ttk.Checkbutton(grid1, text="Pretrained encoder", variable=self.target_pretrained_var)\
-            .grid(row=3, column=4, sticky="w", padx=(6,0))
-        ttk.Checkbutton(grid1, text="Allow empty (no-target) images", variable=self.target_allow_empty_var)\
-            .grid(row=3, column=2, columnspan=2, sticky="w", padx=4)
-        grid1.grid_columnconfigure(1, weight=1)
-
-        r += 1
-        tbar2 = ttk.Frame(tab1); tbar2.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4,0))
-        ttk.Button(tbar2, text="Train Model", command=self._launch_target_training).pack(side="left")
-        ttk.Button(tbar2, text="Load Model", command=self._load_target_model).pack(side="left", padx=(8,0))
-
-        # --- Model Inference Settings
-        r += 1
-        tipf = ttk.LabelFrame(tab1, text=" Inference Settings ", padding=8)
-        tipf.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8,4))
-        ttk.Checkbutton(
-            tipf,
-            text="Use custom model for segmentation (no SAM)",
-            variable=self.target_use_tipseg,
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
-
-        ttk.Label(tipf, text="Threshold").grid(row=1, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0.05, to=0.95, increment=0.05, textvariable=self.target_tipseg_thresh, width=6)\
-            .grid(row=1, column=1, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Min area (px)").grid(row=1, column=2, sticky="e", padx=(16,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=200000, increment=50, textvariable=self.target_tipseg_min_area, width=8)\
-            .grid(row=1, column=3, sticky="w", pady=(4,0))
-        ttk.Checkbutton(tipf, text="Keep largest component", variable=self.target_tipseg_keep_largest)\
-            .grid(row=2, column=0, columnspan=3, sticky="w", pady=(4,0))
-
-        ttk.Checkbutton(tipf, text="Sliding window (large images)", variable=self.tipseg_use_tiles)\
-            .grid(row=3, column=0, columnspan=3, sticky="w", pady=(6,0))
-        ttk.Label(tipf, text="Tile").grid(row=4, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=128, to=2048, increment=64, textvariable=self.tipseg_tile_size, width=8)\
-            .grid(row=4, column=1, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Stride").grid(row=4, column=2, sticky="e", padx=(16,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=64, to=2048, increment=64, textvariable=self.tipseg_stride, width=8)\
-            .grid(row=4, column=3, sticky="w", pady=(4,0))
-        ttk.Checkbutton(tipf, text="Color-guided scan (faster)", variable=self.tipseg_color_guided)\
-            .grid(row=5, column=0, columnspan=3, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Color area min").grid(row=5, column=2, sticky="e", padx=(16,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=50000, increment=50, textvariable=self.tipseg_color_min_area, width=8)\
-            .grid(row=5, column=3, sticky="w", pady=(4,0))
-
-        ttk.Label(tipf, text="Hue low/high").grid(row=6, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=179, increment=1, textvariable=self.tipseg_hue_low, width=6)\
-            .grid(row=6, column=1, sticky="w", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=179, increment=1, textvariable=self.tipseg_hue_high, width=6)\
-            .grid(row=6, column=2, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Sat min").grid(row=6, column=3, sticky="e", padx=(8,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_sat_min, width=6)\
-            .grid(row=6, column=4, sticky="w", pady=(4,0))
-
-        ttk.Label(tipf, text="Val min").grid(row=7, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_val_min, width=6)\
-            .grid(row=7, column=1, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Brown V max").grid(row=7, column=2, sticky="e", padx=(8,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_val_brown_max, width=6)\
-            .grid(row=7, column=3, sticky="w", pady=(4,0))
-
-        ttk.Label(tipf, text="Min leaf %").grid(row=8, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0.0, to=100.0, increment=0.5, textvariable=self.tipseg_min_leaf_pct, width=6)\
-            .grid(row=8, column=1, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Min stress %").grid(row=8, column=2, sticky="e", padx=(8,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0.0, to=100.0, increment=0.5, textvariable=self.tipseg_min_stress_pct, width=6)\
-            .grid(row=8, column=3, sticky="w", pady=(4,0))
-        ttk.Checkbutton(tipf, text="Stop after first hit", variable=self.tipseg_stop_after_first)\
-            .grid(row=9, column=0, columnspan=3, sticky="w", pady=(4,0))
-
-        ttk.Checkbutton(tipf, text="Remove white background", variable=self.tipseg_remove_white)\
-            .grid(row=10, column=0, columnspan=3, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="White sat max").grid(row=11, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_white_sat_max, width=6)\
-            .grid(row=11, column=1, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="White val min").grid(row=11, column=2, sticky="e", padx=(8,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_white_val_min, width=6)\
-            .grid(row=11, column=3, sticky="w", pady=(4,0))
-
-        ttk.Checkbutton(tipf, text="Remove green leaf", variable=self.tipseg_remove_green)\
-            .grid(row=12, column=0, columnspan=3, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Green hue low/high").grid(row=13, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=179, increment=1, textvariable=self.tipseg_green_hue_low, width=6)\
-            .grid(row=13, column=1, sticky="w", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=179, increment=1, textvariable=self.tipseg_green_hue_high, width=6)\
-            .grid(row=13, column=2, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Green sat min").grid(row=13, column=3, sticky="e", padx=(8,4), pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_green_sat_min, width=6)\
-            .grid(row=13, column=4, sticky="w", pady=(4,0))
-        ttk.Label(tipf, text="Green val min").grid(row=14, column=0, sticky="e", pady=(4,0))
-        ttk.Spinbox(tipf, from_=0, to=255, increment=5, textvariable=self.tipseg_green_val_min, width=6)\
-            .grid(row=14, column=1, sticky="w", pady=(4,0))
-
-        # Bind scroll to all children after adding widgets
+        tab_train.build(self, tab1)
         tab1._bind_scroll()
 
-        # ════════════════════════════════════════════════════════════════════
-        # TAB 2: Leaf Completion (Geometric shape fitting)
-        # ════════════════════════════════════════════════════════════════════
+        # ── Tab 2: Leaf Completion ────────────────────────────────────────────
         tab2 = self._make_scrollable_tab(notebook, "  Leaf Completion  ")
-
-        # Main container - 3 column grid layout that fills the space
-        main_container = ttk.Frame(tab2)
-        main_container.grid(row=0, column=0, sticky="nsew")
-        tab2.grid_columnconfigure(0, weight=1)
-        tab2.grid_rowconfigure(0, weight=1)
-
-        # Configure 3 columns with equal weight for preview columns
-        main_container.grid_columnconfigure(0, weight=0)  # Options - fixed width
-        main_container.grid_columnconfigure(1, weight=1)  # Original - expand
-        main_container.grid_columnconfigure(2, weight=1)  # Completed - expand
-        main_container.grid_rowconfigure(0, weight=1)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # COLUMN 1: Options (Leaf Shapes + Controls)
-        # ═══════════════════════════════════════════════════════════════════
-        options_frame = ttk.Frame(main_container)
-        options_frame.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=4)
-
-        # LEAF SHAPES GALLERY (2x3 grid)
-        shapes_frame = ttk.LabelFrame(options_frame, text=" Leaf Shapes ", padding=8)
-        shapes_frame.pack(fill="x", pady=(0, 8))
-
-        shape_options = ["Ellipse", "Orbicular", "Ovate", "Obovate", "Lanceolate", "Ensiform"]
-
-        self._leaf_shape_canvases = {}
-        self.shape_extend_var = tk.StringVar(value="Ellipse")
-
-        for i, shape in enumerate(shape_options):
-            row, col = i // 3, i % 3
-            shape_item = ttk.Frame(shapes_frame)
-            shape_item.grid(row=row, column=col, padx=6, pady=4)
-
-            # Preview canvas
-            canvas = tk.Canvas(shape_item, width=50, height=50, bg=self.colors['bg_dark'],
-                               highlightthickness=2, highlightbackground=self.colors['bg_medium'])
-            canvas.pack()
-            self._leaf_shape_canvases[shape] = canvas
-            self._draw_leaf_shape_on_canvas(canvas, shape, 50, 50)
-
-            # Shape name + radio button
-            name_frame = ttk.Frame(shape_item)
-            name_frame.pack(pady=(2, 0))
-            rb = ttk.Radiobutton(name_frame, text="", variable=self.shape_extend_var, value=shape,
-                                 command=self._on_leaf_shape_selected)
-            rb.pack(side="left")
-            ttk.Label(name_frame, text=shape, font=("Helvetica", 8, "bold")).pack(side="left")
-
-        # COMPLETION CONTROLS
-        ctrl_frame = ttk.LabelFrame(options_frame, text=" Apply Completion ", padding=8)
-        ctrl_frame.pack(fill="x", pady=(0, 8))
-
-        # Selected shape display
-        shape_row = ttk.Frame(ctrl_frame)
-        shape_row.pack(fill="x", pady=(0, 6))
-
-        ttk.Label(shape_row, text="Selected:").pack(side="left", padx=(0, 6))
-        self._leaf_shape_canvas = tk.Canvas(shape_row, width=28, height=28, bg=self.colors['bg_dark'],
-                                            highlightthickness=1, highlightbackground=self.colors['accent'])
-        self._leaf_shape_canvas.pack(side="left", padx=(0, 6))
-        self._selected_shape_label = ttk.Label(shape_row, text="Ellipse", font=("Helvetica", 10, "bold"))
-        self._selected_shape_label.pack(side="left")
-
-        # Preview button
-        ttk.Button(ctrl_frame, text="▶ Preview", command=self._preview_leaf_completion,
-                   style='Accent.TButton').pack(fill="x", pady=(0, 4))
-
-        # Size adjustment row
-        size_row = ttk.Frame(ctrl_frame)
-        size_row.pack(fill="x", pady=(0, 4))
-
-        ttk.Label(size_row, text="Adjust size:").pack(side="left", padx=(0, 6))
-
-        self._leaf_shrink_btn = ttk.Button(size_row, text=" − ", width=3, command=self._shrink_leaf_shape,
-                                           state="disabled")
-        self._leaf_shrink_btn.pack(side="left", padx=(0, 2))
-
-        self._leaf_scale_label = ttk.Label(size_row, text="100%", width=5, anchor="center")
-        self._leaf_scale_label.pack(side="left", padx=2)
-
-        self._leaf_grow_btn = ttk.Button(size_row, text=" + ", width=3, command=self._grow_leaf_shape,
-                                         state="disabled")
-        self._leaf_grow_btn.pack(side="left", padx=(2, 0))
-
-        # Scale factor (1.0 = 100%)
-        self._leaf_scale_factor = 1.0
-
-        # Edit Shape button (opens contour editor)
-        self._leaf_edit_btn = ttk.Button(ctrl_frame, text="✏ Edit Shape", command=self._edit_leaf_shape,
-                                         state="disabled")
-        self._leaf_edit_btn.pack(fill="x", pady=(0, 4))
-
-        # Update and Cancel buttons
-        self._leaf_update_btn = ttk.Button(ctrl_frame, text="✓ Update Mask", command=self._apply_leaf_completion,
-                                           state="disabled")
-        self._leaf_update_btn.pack(fill="x", pady=(0, 4))
-
-        ttk.Button(ctrl_frame, text="✗ Cancel", command=self._cancel_leaf_completion).pack(fill="x")
-
-        # Tip
-        ttk.Label(options_frame, text="Select mask → Preview → Update",
-                  font=("Helvetica", 8)).pack(anchor="w")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # COLUMN 2: Original Mask Preview
-        # ═══════════════════════════════════════════════════════════════════
-        orig_frame = ttk.LabelFrame(main_container, text=" Original Mask ", padding=8)
-        orig_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=4)
-        orig_frame.grid_columnconfigure(0, weight=1)
-        orig_frame.grid_rowconfigure(0, weight=1)
-
-        self._leaf_orig_canvas = tk.Canvas(orig_frame, width=250, height=250, bg=self.colors['canvas_bg'],
-                                           highlightthickness=2, highlightbackground=self.colors['bg_medium'])
-        self._leaf_orig_canvas.pack(expand=True, fill="both", padx=10, pady=(10, 5))
-
-        # ═══════════════════════════════════════════════════════════════════
-        # COLUMN 3: Completed Mask Preview
-        # ═══════════════════════════════════════════════════════════════════
-        comp_frame = ttk.LabelFrame(main_container, text=" Completed Mask ", padding=8)
-        comp_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0), pady=4)
-        comp_frame.grid_columnconfigure(0, weight=1)
-        comp_frame.grid_rowconfigure(0, weight=1)
-
-        self._leaf_comp_canvas = tk.Canvas(comp_frame, width=250, height=250, bg=self.colors['canvas_bg'],
-                                           highlightthickness=2, highlightbackground=self.colors['bg_medium'])
-        self._leaf_comp_canvas.pack(expand=True, fill="both", padx=10, pady=(10, 5))
-
-        # ═══════════════════════════════════════════════════════════════════
-        # ZOOM CONTROLS (spans both preview columns)
-        # ═══════════════════════════════════════════════════════════════════
-        zoom_frame = ttk.Frame(main_container)
-        zoom_frame.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 4))
-
-        ttk.Label(zoom_frame, text="Zoom:", font=("Helvetica", 9)).pack(side="left", padx=(10, 5))
-
-        ttk.Button(zoom_frame, text=" − ", width=3,
-                   command=lambda: self._leaf_zoom_by(0.8)).pack(side="left", padx=2)
-
-        self._leaf_zoom_label = ttk.Label(zoom_frame, text="100%", width=5, anchor="center")
-        self._leaf_zoom_label.pack(side="left", padx=2)
-
-        ttk.Button(zoom_frame, text=" + ", width=3,
-                   command=lambda: self._leaf_zoom_by(1.25)).pack(side="left", padx=2)
-
-        ttk.Button(zoom_frame, text="Fit", width=4,
-                   command=self._leaf_zoom_fit).pack(side="left", padx=(10, 2))
-
-        # Initialize zoom factor for leaf completion preview
-        self._leaf_preview_zoom = 1.0
-
-        # Bind mousewheel to canvases for zoom
-        self._leaf_orig_canvas.bind("<MouseWheel>", self._leaf_canvas_mousewheel)
-        self._leaf_comp_canvas.bind("<MouseWheel>", self._leaf_canvas_mousewheel)
-        # For Linux
-        self._leaf_orig_canvas.bind("<Button-4>", lambda e: self._leaf_zoom_by(1.1))
-        self._leaf_orig_canvas.bind("<Button-5>", lambda e: self._leaf_zoom_by(0.9))
-        self._leaf_comp_canvas.bind("<Button-4>", lambda e: self._leaf_zoom_by(1.1))
-        self._leaf_comp_canvas.bind("<Button-5>", lambda e: self._leaf_zoom_by(0.9))
-
-        # Bind mouse drag on completed canvas to move the shape
-        self._leaf_comp_canvas.bind("<ButtonPress-1>", self._leaf_drag_start)
-        self._leaf_comp_canvas.bind("<B1-Motion>", self._leaf_drag_move)
-        self._leaf_comp_canvas.bind("<ButtonRelease-1>", self._leaf_drag_end)
-
-        # Initialize shape offset (for moving the fitted shape)
-        self._leaf_shape_offset = [0, 0]  # [dx, dy] in pixels
-        self._leaf_drag_start_pos = None
-
-        # Position and Rotation controls
-        adjust_frame = ttk.Frame(main_container)
-        adjust_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(0, 4))
-
-        # Position controls
-        ttk.Label(adjust_frame, text="Position:", font=("Helvetica", 9)).pack(side="left", padx=(10, 5))
-
-        self._leaf_offset_label = ttk.Label(adjust_frame, text="(0, 0)", width=8, anchor="center")
-        self._leaf_offset_label.pack(side="left", padx=2)
-
-        ttk.Button(adjust_frame, text="Reset", width=4,
-                   command=self._leaf_reset_position).pack(side="left", padx=(5, 2))
-
-        # Separator
-        ttk.Separator(adjust_frame, orient="vertical").pack(side="left", padx=10, fill="y", pady=2)
-
-        # Rotation controls
-        ttk.Label(adjust_frame, text="Rotate:", font=("Helvetica", 9)).pack(side="left", padx=(0, 5))
-
-        ttk.Button(adjust_frame, text=" ↶ ", width=3,
-                   command=lambda: self._leaf_rotate(-5)).pack(side="left", padx=2)
-
-        self._leaf_rotation_label = ttk.Label(adjust_frame, text="0°", width=5, anchor="center")
-        self._leaf_rotation_label.pack(side="left", padx=2)
-
-        ttk.Button(adjust_frame, text=" ↷ ", width=3,
-                   command=lambda: self._leaf_rotate(5)).pack(side="left", padx=2)
-
-        ttk.Button(adjust_frame, text="Reset", width=4,
-                   command=self._leaf_reset_rotation).pack(side="left", padx=(5, 2))
-
-        # Initialize rotation offset
-        self._leaf_rotation_offset = 0  # degrees
-
-        # Tip
-        ttk.Label(adjust_frame, text="(Drag to move)", font=("Helvetica", 8)).pack(side="left", padx=(15, 0))
-
-        # Stats label at bottom spanning all columns
-        self._leaf_stats_label = ttk.Label(main_container, text="Select a mask to preview", font=("Helvetica", 9))
-        self._leaf_stats_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # Initialize state
-        self._pending_leaf_completion = None
-
-        # Initialize the selected shape preview
-        self.root.after(100, self._update_leaf_shape_preview)
-        self.root.after(100, self._on_leaf_shape_selected)
-
-        # Bind scroll to all children after adding widgets
+        tab_leaf_completion.build(self, tab2)
         tab2._bind_scroll()
 
-        # ════════════════════════════════════════════════════════════════════
-        # TAB 3: Leaf Unfolding (Rotate parts of folded leaves)
-        # ════════════════════════════════════════════════════════════════════
+        # ── Tab 3: Leaf Unfolding ─────────────────────────────────────────────
         tab3 = self._make_scrollable_tab(notebook, "  Leaf Unfolding  ")
-
-        # Main container - 3 column grid layout
-        unfold_container = ttk.Frame(tab3)
-        unfold_container.grid(row=0, column=0, sticky="nsew")
-
-        # Configure columns
-        unfold_container.grid_columnconfigure(0, weight=0)  # Options - fixed
-        unfold_container.grid_columnconfigure(1, weight=1)  # Original - expand
-        unfold_container.grid_columnconfigure(2, weight=1)  # Unfolded - expand
-        unfold_container.grid_rowconfigure(0, weight=1)
-
-        # Column 0: Options
-        opt_frame = ttk.LabelFrame(unfold_container, text=" Options ", padding=8)
-        opt_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8), pady=4)
-
-        # Instructions
-        ttk.Label(opt_frame, text="Select 2+ masks in the\nmask list, then Preview.",
-                  font=("Helvetica", 9), justify="left").pack(anchor="w", pady=(0, 10))
-
-        # Preview button
-        self._unfold_preview_btn = ttk.Button(opt_frame, text="Preview Selected",
-                                               command=self._preview_leaf_unfolding)
-        self._unfold_preview_btn.pack(fill="x", pady=(0, 10))
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Mask to rotate selection
-        ttk.Label(opt_frame, text="Rotate mask:", font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self._unfold_mask_var = tk.StringVar(value="mask_1")
-        self._unfold_mask_frame = ttk.Frame(opt_frame)
-        self._unfold_mask_frame.pack(fill="x", pady=(4, 10))
-        # Radio buttons will be populated when masks are loaded
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Rotation controls
-        ttk.Label(opt_frame, text="Rotation:", font=("Helvetica", 9, "bold")).pack(anchor="w")
-
-        rot_frame = ttk.Frame(opt_frame)
-        rot_frame.pack(fill="x", pady=4)
-
-        ttk.Button(rot_frame, text=" ↶ ", width=3,
-                   command=lambda: self._unfold_rotate(-5)).pack(side="left", padx=2)
-        self._unfold_angle_label = ttk.Label(rot_frame, text="0°", width=6, anchor="center")
-        self._unfold_angle_label.pack(side="left", padx=4)
-        ttk.Button(rot_frame, text=" ↷ ", width=3,
-                   command=lambda: self._unfold_rotate(5)).pack(side="left", padx=2)
-
-        # Quick rotation buttons
-        quick_frame = ttk.Frame(opt_frame)
-        quick_frame.pack(fill="x", pady=4)
-        ttk.Button(quick_frame, text="90°", width=4,
-                   command=lambda: self._unfold_set_rotation(90)).pack(side="left", padx=2)
-        ttk.Button(quick_frame, text="180°", width=4,
-                   command=lambda: self._unfold_set_rotation(180)).pack(side="left", padx=2)
-        ttk.Button(quick_frame, text="-90°", width=4,
-                   command=lambda: self._unfold_set_rotation(-90)).pack(side="left", padx=2)
-
-        ttk.Button(opt_frame, text="Reset Rotation", command=self._unfold_reset_rotation).pack(fill="x", pady=(8, 4))
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Flip controls
-        ttk.Label(opt_frame, text="Flip:", font=("Helvetica", 9, "bold")).pack(anchor="w")
-
-        flip_frame = ttk.Frame(opt_frame)
-        flip_frame.pack(fill="x", pady=4)
-
-        ttk.Button(flip_frame, text="↔ Horizontal", width=10,
-                   command=self._unfold_flip_horizontal).pack(side="left", padx=2)
-        ttk.Button(flip_frame, text="↕ Vertical", width=10,
-                   command=self._unfold_flip_vertical).pack(side="left", padx=2)
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Pivot point options
-        ttk.Label(opt_frame, text="Pivot point:", font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self._unfold_pivot_var = tk.StringVar(value="junction")
-        ttk.Radiobutton(opt_frame, text="Auto (junction)", variable=self._unfold_pivot_var,
-                        value="junction", command=self._unfold_update_preview).pack(anchor="w")
-        ttk.Radiobutton(opt_frame, text="Mask center", variable=self._unfold_pivot_var,
-                        value="center", command=self._unfold_update_preview).pack(anchor="w")
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Position offset (drag tip)
-        ttk.Label(opt_frame, text="Position:", font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self._unfold_offset_label = ttk.Label(opt_frame, text="(0, 0)", font=("Helvetica", 9))
-        self._unfold_offset_label.pack(anchor="w", pady=2)
-        ttk.Button(opt_frame, text="Reset Position", command=self._unfold_reset_position).pack(fill="x", pady=4)
-        ttk.Label(opt_frame, text="(Drag preview to move)", font=("Helvetica", 8)).pack(anchor="w")
-
-        ttk.Separator(opt_frame, orient="horizontal").pack(fill="x", pady=8)
-
-        # Action buttons
-        btn_frame = ttk.Frame(opt_frame)
-        btn_frame.pack(fill="x", pady=8)
-
-        self._unfold_update_btn = ttk.Button(btn_frame, text="Update", state="disabled",
-                                              command=self._apply_leaf_unfolding)
-        self._unfold_update_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
-
-        self._unfold_cancel_btn = ttk.Button(btn_frame, text="Cancel",
-                                              command=self._cancel_leaf_unfolding)
-        self._unfold_cancel_btn.pack(side="left", fill="x", expand=True)
-
-        # Column 1: Original preview
-        orig_frame = ttk.LabelFrame(unfold_container, text=" Original (Selected Masks) ", padding=4)
-        orig_frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
-        orig_frame.grid_rowconfigure(0, weight=1)
-        orig_frame.grid_columnconfigure(0, weight=1)
-
-        self._unfold_orig_canvas = tk.Canvas(orig_frame, bg=self.colors['canvas_bg'],
-                                              highlightthickness=1, highlightbackground=self.colors['border'])
-        self._unfold_orig_canvas.grid(row=0, column=0, sticky="nsew")
-
-        # Column 2: Unfolded preview
-        unfold_frame = ttk.LabelFrame(unfold_container, text=" Unfolded Preview ", padding=4)
-        unfold_frame.grid(row=0, column=2, sticky="nsew", padx=4, pady=4)
-        unfold_frame.grid_rowconfigure(0, weight=1)
-        unfold_frame.grid_columnconfigure(0, weight=1)
-
-        self._unfold_result_canvas = tk.Canvas(unfold_frame, bg=self.colors['canvas_bg'],
-                                                highlightthickness=1, highlightbackground=self.colors['border'])
-        self._unfold_result_canvas.grid(row=0, column=0, sticky="nsew")
-
-        # Bind drag events on result canvas
-        self._unfold_result_canvas.bind("<Button-1>", self._unfold_drag_start)
-        self._unfold_result_canvas.bind("<B1-Motion>", self._unfold_drag_move)
-        self._unfold_result_canvas.bind("<ButtonRelease-1>", self._unfold_drag_end)
-
-        # Zoom controls row
-        zoom_frame = ttk.Frame(unfold_container)
-        zoom_frame.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 4))
-
-        ttk.Label(zoom_frame, text="Zoom:", font=("Helvetica", 9)).pack(side="left", padx=(4, 8))
-        ttk.Button(zoom_frame, text=" − ", width=3,
-                   command=lambda: self._unfold_zoom_by(0.8)).pack(side="left", padx=2)
-        self._unfold_zoom_label = ttk.Label(zoom_frame, text="100%", width=5, anchor="center")
-        self._unfold_zoom_label.pack(side="left", padx=4)
-        ttk.Button(zoom_frame, text=" + ", width=3,
-                   command=lambda: self._unfold_zoom_by(1.25)).pack(side="left", padx=2)
-        ttk.Button(zoom_frame, text="Fit", width=4,
-                   command=self._unfold_zoom_fit).pack(side="left", padx=(8, 2))
-
-        # Stats label
-        self._unfold_stats_label = ttk.Label(unfold_container, text="Select 2+ masks to unfold",
-                                              font=("Helvetica", 9))
-        self._unfold_stats_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # Initialize state
-        self._unfold_rotation_angle = 0
-        self._unfold_offset = [0, 0]
-        self._unfold_zoom = 1.0
-        self._unfold_masks = []  # List of (idx, mask) tuples
-        self._unfold_pending = None
-        self._unfold_drag_start_pos = None
-
+        tab_leaf_unfolding.build(self, tab3)
         tab3._bind_scroll()
 
-        # ════════════════════════════════════════════════════════════════════
-        # SHARED LOG AREA (below tabs)
-        # ════════════════════════════════════════════════════════════════════
+        # ── Shared Training Log ───────────────────────────────────────────────
         log_frame = ttk.LabelFrame(tf, text=" Training Log ", padding=4)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
-
-        self.train_log = tk.Text(log_frame, height=8, width=100, bg=self.colors['bg_pale'], fg=self.colors['text_dark'])
+        self.train_log = tk.Text(
+            log_frame, height=8, width=100,
+            bg=self.colors['bg_pale'], fg=self.colors['text_dark'])
         self.train_log.pack(fill="both", expand=True)
         return tf
 
@@ -3347,7 +1537,7 @@ class LeafSegmenterGUI:
         # Right section: Active weights + shortcuts
         self._weights_label = tk.Label(
             status_frame, text="Weights: (none)",
-            bg=c['bg_dark'], fg=c['bg_light'],
+            bg=c['bg_dark'], fg=c['text_muted'],
             font=("Helvetica", 9), padx=10
         )
         self._weights_label.pack(side="right")
@@ -3355,14 +1545,55 @@ class LeafSegmenterGUI:
         shortcuts_text = "⌨ Ctrl+O: Open  |  Ctrl+S: Save  |  Del: Delete mask  |  Ctrl+Z: Undo"
         self._shortcuts_label = tk.Label(
             status_frame, text=shortcuts_text,
-            bg=c['bg_dark'], fg=c['bg_light'],
+            bg=c['bg_dark'], fg=c['text_muted'],
             font=("Helvetica", 9), padx=10
         )
+
+        # Undo counter badge
+        self._undo_label = tk.Label(
+            status_frame, text="Undo: —",
+            bg=c['bg_dark'], fg=c['text_muted'],
+            font=("Helvetica", 9, "bold"), padx=10,
+            cursor="hand2",
+        )
+        self._undo_label.pack(side="right")
+        self._undo_label.bind("<Button-1>", self.undo)
         self._shortcuts_label.pack(side="right")
+
+        # Current file label — always visible centre of status bar
+        self._file_label = tk.Label(
+            status_frame,
+            text="No file loaded",
+            bg=c['bg_dark'], fg=c['accent'],
+            font=("Helvetica", 9, "bold"), padx=12,
+        )
+        self._file_label.pack(side="left", padx=(20, 0))
 
         # Separator line above status bar
         sep = tk.Frame(root, bg=c['border'], height=1)
         sep.grid(row=2, column=0, columnspan=2, sticky="new")
+
+    def _update_file_label(self) -> None:
+        """Update the filename badge in the status bar."""
+        if not hasattr(self, "_file_label"):
+            return
+        if self.img_path:
+            name = Path(self.img_path).name
+            # Show batch context if in folder mode
+            if self.batch_images and self.batch_idx >= 0:
+                n = len(self.batch_images)
+                i = self.batch_idx + 1
+                self._file_label.configure(
+                    text=f"📄 {name}  [{i} / {n}]",
+                    fg=self.colors["accent"])
+            else:
+                self._file_label.configure(
+                    text=f"📄 {name}",
+                    fg=self.colors["accent"])
+        else:
+            self._file_label.configure(
+                text="No file loaded",
+                fg=self.colors["text_muted"])
 
     def set_status(self, message, status_type="info"):
         """Update the status bar with a message and icon.
@@ -3430,9 +1661,58 @@ class LeafSegmenterGUI:
         self.root.bind("<Control-minus>", lambda e: self._zoom_by(0.8))
         self.root.bind("<Control-0>", lambda e: self._zoom_fit())
 
+        # Undo
+        self.root.bind("<Control-z>", self.undo)
+        self.root.bind("<Command-z>", self.undo)   # macOS
+
         # Navigation
         self.root.bind("<Control-Left>", lambda e: self.prev_image())
         self.root.bind("<Control-Right>", lambda e: self.next_image())
+
+    # =========================================================================
+    # Undo system
+    # =========================================================================
+
+    def _push_undo(self, label: str = "action") -> None:
+        """Snapshot current masks list onto the undo stack before a mutation."""
+        if not self.sr:
+            return
+        import copy
+        snapshot = copy.deepcopy(self.sr.masks)
+        self._undo_stack.append((label, snapshot))
+        if len(self._undo_stack) > self._undo_max:
+            self._undo_stack.pop(0)
+        self._update_undo_status()
+
+    def undo(self, event=None) -> None:
+        """Restore the most recent snapshot from the undo stack."""
+        if not self._undo_stack:
+            self.set_status("Nothing to undo", "info")
+            return
+        if not self.sr:
+            return
+        label, snapshot = self._undo_stack.pop()
+        import copy
+        self.sr.masks = copy.deepcopy(snapshot)
+        if hasattr(self, "_picks"):
+            self._picks.clear()
+        self._rebuild_mask_list()
+        self._sync_listbox_selection_from_picks()
+        if self.img_preview is not None:
+            self.show_image(self.img_preview)
+        elif self.img is not None:
+            self.show_image(self.img)
+        self._update_undo_status()
+        self.set_status(f"Undid: {label}  ({len(self._undo_stack)} left)", "success")
+
+    def _update_undo_status(self) -> None:
+        """Update the undo count badge in the status bar if the label exists."""
+        n = len(self._undo_stack)
+        if hasattr(self, "_undo_label"):
+            self._undo_label.configure(
+                text=f"Undo: {n}" if n else "Undo: —",
+                fg=self.colors["accent"] if n else self.colors["text_muted"],
+            )
 
     def _browse_file_into(self, var, ftypes=("All","*.*")):
         p = filedialog.askopenfilename(filetypes=[ftypes] if isinstance(ftypes, tuple) else [("All","*.*")])
@@ -4603,6 +2883,8 @@ class LeafSegmenterGUI:
             messagebox.showwarning("No selection", "Select one or more masks to delete.")
             return
 
+        self._push_undo("delete mask")
+
         # delete from the end to avoid index shifts
         for idx in sorted(sel, reverse=True):
             if 0 <= idx < len(self.sr.masks):
@@ -4631,6 +2913,8 @@ class LeafSegmenterGUI:
         """
         if not self.sr or not self.sr.masks or len(idxs) < 2:
             return False
+
+        self._push_undo("combine masks")
 
         # Sort and choose one to keep (smallest idx)
         idxs = sorted(set(int(i) for i in idxs if 0 <= int(i) < len(self.sr.masks)))
@@ -4672,6 +2956,7 @@ class LeafSegmenterGUI:
         if len(sel) != 1:
             messagebox.showwarning("Pick one", "Select exactly one mask to extend.")
             return
+        self._push_undo("extend mask")
         i = sel[0]
         base = self.sr.masks[i]["segmentation"].astype(bool)
 
@@ -5054,6 +3339,7 @@ class LeafSegmenterGUI:
 
     def _apply_leaf_completion(self):
         """Apply the pending leaf completion to the mask."""
+        self._push_undo("leaf completion")
         if not self._pending_leaf_completion:
             messagebox.showwarning("Leaf Completion", "No pending completion. Click 'Preview' first.")
             return
@@ -5878,150 +4164,308 @@ class LeafSegmenterGUI:
                            offset: tuple = (0, 0), rotation: float = 0) -> np.ndarray | None:
         """Fit a geometric shape to the mask and return the completed mask.
 
+        Alignment strategy (automatic, no user effort needed):
+          1. CENTROID  — shape center = pixel centroid of the mask
+          2. ORIENTATION — shape angle = PCA major axis of the mask pixels
+          3. SCALE — shape axes = PCA major/minor lengths × scale factor
+
         Args:
             mask: Binary mask (bool array)
-            shape_type: One of 'Ellipse', 'Orbicular', 'Ovate', 'Obovate', 'Lanceolate', 'Ensiform'
-            scale: Scale factor for the fitted shape (1.0 = 100%, 1.1 = 110%, etc.)
-            offset: (dx, dy) offset to move the shape center in pixels
-            rotation: Additional rotation in degrees to apply to the shape
+            shape_type: Shape name string (matches LEAF_SHAPES in tab_leaf_completion.py)
+            scale: Scale factor (1.0 = fit tightly to mask extents)
+            offset: (dx, dy) manual drag offset in pixels
+            rotation: Additional rotation in degrees (from rotate buttons)
 
         Returns:
-            Completed binary mask or None if fitting failed
+            Completed binary mask (bool) or None if fitting failed
         """
-        # Convert to uint8 for cv2
-        mask_uint8 = mask.astype(np.uint8) * 255
+        H, W = mask.shape[:2]
+        completed = np.zeros((H, W), dtype=np.uint8)
 
-        # Find contours
-        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        # ── 1. CENTROID — pixel centre of mass ───────────────────────────────
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 5:
             return None
+        cx = float(xs.mean()) + offset[0]
+        cy = float(ys.mean()) + offset[1]
 
-        cnt = max(contours, key=cv2.contourArea)
-        if len(cnt) < 5:
-            return None
+        # ── 2. PCA ORIENTATION — major axis angle ────────────────────────────
+        pts = np.stack([xs, ys], axis=1).astype(np.float32)
+        pts_c = pts - pts.mean(axis=0)
+        cov = (pts_c.T @ pts_c) / max(1, len(pts_c) - 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1]   # largest eigenvalue first
+        vmaj = eigvecs[:, order[0]]          # major axis direction vector
 
-        # Fit ellipse as base
-        ellipse = cv2.fitEllipse(cnt)
-        center, axes, angle = ellipse
+        # cv2.ellipse angle convention: degrees from vertical (Y-axis), clockwise
+        pca_angle = float(np.degrees(np.arctan2(vmaj[0], vmaj[1]))) + rotation
 
-        # Apply offset to center
-        center = (center[0] + offset[0], center[1] + offset[1])
+        # ── 3. SCALE — PCA-based axis lengths ────────────────────────────────
+        proj_maj = pts_c @ vmaj
+        proj_min = pts_c @ np.array([-vmaj[1], vmaj[0]])
+        half_maj = float((proj_maj.max() - proj_maj.min()) / 2.0) * scale
+        half_min = float((proj_min.max() - proj_min.min()) / 2.0) * scale
+        half_maj = max(half_maj, 3.0)
+        half_min = max(half_min, 3.0)
 
-        # Apply rotation offset to angle
-        angle = angle + rotation
+        # cv2 ellipse axes = (half_minor, half_major) when angle aligns with Y
+        axes = (half_min, half_maj)
+        center_i = (int(round(cx)), int(round(cy)))
 
-        # Apply scale to axes
-        axes = (axes[0] * scale, axes[1] * scale)
-        ellipse = (center, axes, angle)
+        # ── Helper: draw rotated polygon on `completed` ───────────────────────
+        def _rot_pts(local_pts_nm):
+            """Convert normalised [-1..1] local coords → pixel coords.
+            local_pts_nm: list of (u, v) where u=minor axis, v=major axis.
+            """
+            ang_r = np.radians(pca_angle)
+            cos_a, sin_a = np.cos(ang_r), np.sin(ang_r)
+            # major axis direction in image space
+            maj_x =  sin_a;  maj_y = cos_a
+            min_x =  cos_a;  min_y = -sin_a
+            out = []
+            for u, v in local_pts_nm:
+                px = cx + u * half_min * min_x + v * half_maj * maj_x
+                py = cy + u * half_min * min_y + v * half_maj * maj_y
+                out.append((int(round(px)), int(round(py))))
+            return np.array(out, dtype=np.int32)
 
-        major_axis = max(axes)
-        minor_axis = min(axes)
+        s = shape_type.lower().replace("-", "").replace(" ", "")
 
-        # Create output mask
-        completed = np.zeros_like(mask, dtype=np.uint8)
+        # ── Draw each shape ───────────────────────────────────────────────────
 
-        if shape_type == "Ellipse":
-            # Simple ellipse
-            cv2.ellipse(completed, ellipse, 255, -1)
+        if s in ("ellipse", "elliptical"):
+            cv2.ellipse(completed, center_i, (int(half_min), int(half_maj)),
+                        pca_angle, 0, 360, 255, -1)
 
-        elif shape_type == "Orbicular":
-            # Round with stem notch at base
-            cv2.ellipse(completed, ellipse, 255, -1)
-            # Add small notch at bottom for stem
-            notch_size = int(minor_axis * 0.15)
-            # Find the bottom point of ellipse (based on angle)
-            angle_rad = np.radians(angle)
-            # Bottom is perpendicular to major axis
-            notch_x = int(center[0] + (major_axis/2) * np.sin(angle_rad))
-            notch_y = int(center[1] + (major_axis/2) * np.cos(angle_rad))
-            cv2.circle(completed, (notch_x, notch_y), notch_size, 0, -1)
+        elif s == "orbicular":
+            r = int(max(half_maj, half_min))
+            cv2.circle(completed, center_i, r, 255, -1)
 
-        elif shape_type == "Ovate":
-            # Egg-shaped, wider at base - use ellipse but extend one end
-            # Draw base ellipse
-            cv2.ellipse(completed, ellipse, 255, -1)
-            # Make it wider at the base by adding a partial ellipse
-            base_ellipse = (center, (axes[0] * 1.2, axes[1]), angle)
-            # Only fill the base half
-            cv2.ellipse(completed, ellipse, 255, -1)
-            # Shift center toward base and draw wider
-            shift = major_axis * 0.15
-            new_center = (center[0] + shift * np.sin(np.radians(angle)),
-                         center[1] + shift * np.cos(np.radians(angle)))
-            wider_axes = (axes[0] * 1.15, axes[1] * 0.9)
-            cv2.ellipse(completed, (new_center, wider_axes, angle), 255, -1)
+        elif s == "ovate":
+            # Egg: wide rounded base, tapered apex
+            # Shift centroid slightly toward base so widest part ~40% from bottom
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),  # apex
+                ( 0.55, -0.40),  # upper right
+                ( 0.90,  0.10),  # widest right
+                ( 0.72,  0.65),  # lower right
+                ( 0.28,  1.00),  # base right
+                ( 0.0,   0.85),  # base centre
+                (-0.28,  1.00),
+                (-0.72,  0.65),
+                (-0.90,  0.10),
+                (-0.55, -0.40),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
 
-        elif shape_type == "Obovate":
-            # Egg-shaped, wider at tip (opposite of ovate)
-            cv2.ellipse(completed, ellipse, 255, -1)
-            # Shift center toward tip and draw wider
-            shift = major_axis * 0.15
-            new_center = (center[0] - shift * np.sin(np.radians(angle)),
-                         center[1] - shift * np.cos(np.radians(angle)))
-            wider_axes = (axes[0] * 1.15, axes[1] * 0.9)
-            cv2.ellipse(completed, (new_center, wider_axes, angle), 255, -1)
+        elif s == "obovate":
+            # Reversed egg: wide top, narrow base
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),  # narrow tip top
+                ( 0.40, -0.55),
+                ( 0.88, -0.10),  # widest right (above mid)
+                ( 0.75,  0.50),
+                ( 0.35,  1.00),  # narrow base right
+                ( 0.0,   0.80),
+                (-0.35,  1.00),
+                (-0.75,  0.50),
+                (-0.88, -0.10),
+                (-0.40, -0.55),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
 
-        elif shape_type == "Lanceolate":
-            # Lance-shaped - narrow ellipse with pointed ends
-            # Make it narrower
-            narrow_axes = (axes[0] * 0.6, axes[1] * 1.1)
-            cv2.ellipse(completed, (center, narrow_axes, angle), 255, -1)
-            # Add pointed tips using triangles
-            tip_len = major_axis * 0.2
-            angle_rad = np.radians(angle)
-            # Top tip
-            tip1 = (int(center[0] - (narrow_axes[1]/2 + tip_len) * np.sin(angle_rad)),
-                   int(center[1] - (narrow_axes[1]/2 + tip_len) * np.cos(angle_rad)))
-            # Bottom tip
-            tip2 = (int(center[0] + (narrow_axes[1]/2 + tip_len) * np.sin(angle_rad)),
-                   int(center[1] + (narrow_axes[1]/2 + tip_len) * np.cos(angle_rad)))
-            # Draw triangular tips
-            w = int(narrow_axes[0] * 0.3)
-            for tip in [tip1, tip2]:
-                pts = np.array([
-                    tip,
-                    (int(tip[0] - w * np.cos(angle_rad)), int(tip[1] + w * np.sin(angle_rad))),
-                    (int(tip[0] + w * np.cos(angle_rad)), int(tip[1] - w * np.sin(angle_rad)))
-                ], np.int32)
-                cv2.fillPoly(completed, [pts], 255)
-            # Re-add the ellipse to merge
-            cv2.ellipse(completed, (center, narrow_axes, angle), 255, -1)
+        elif s == "cordate":
+            # Heart: two lobes at top, pointed tip at base
+            # Left lobe
+            lobe_cx = cx - half_min * 0.30
+            lobe_cy = cy - half_maj * 0.35
+            lobe_r  = (half_min * 0.58, half_maj * 0.45)
+            cv2.ellipse(completed,
+                        (int(round(lobe_cx)), int(round(lobe_cy))),
+                        (int(lobe_r[0]), int(lobe_r[1])),
+                        pca_angle, 0, 360, 255, -1)
+            # Right lobe
+            lobe_cx2 = cx + half_min * 0.30
+            cv2.ellipse(completed,
+                        (int(round(lobe_cx2)), int(round(lobe_cy))),
+                        (int(lobe_r[0]), int(lobe_r[1])),
+                        pca_angle, 0, 360, 255, -1)
+            # Lower body to pointed tip
+            pts_poly = _rot_pts([
+                (-0.90, -0.20),
+                ( 0.90, -0.20),
+                ( 0.0,   1.00),   # pointed tip
+                ( 0.0,  -0.10),   # inner notch
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
 
-        elif shape_type == "Ensiform":
-            # Sword-shaped (like maize) - very narrow, elongated
-            # Make axes ratio more extreme
-            if axes[0] > axes[1]:
-                sword_axes = (axes[0] * 0.3, axes[1] * 1.5)
-            else:
-                sword_axes = (axes[0] * 1.5, axes[1] * 0.3)
-            cv2.ellipse(completed, (center, sword_axes, angle), 255, -1)
-            # Add pointed tip
-            angle_rad = np.radians(angle)
-            long_axis = max(sword_axes)
-            tip_len = long_axis * 0.15
-            if sword_axes[1] > sword_axes[0]:
-                # Vertical orientation
-                tip = (int(center[0]), int(center[1] - long_axis/2 - tip_len))
-            else:
-                tip = (int(center[0] - long_axis/2 - tip_len), int(center[1]))
-            short_axis = min(sword_axes)
-            w = int(short_axis * 0.4)
-            pts = np.array([
-                tip,
-                (tip[0] - w, tip[1] + int(tip_len)),
-                (tip[0] + w, tip[1] + int(tip_len))
-            ], np.int32)
-            cv2.fillPoly(completed, [pts], 255)
-            cv2.ellipse(completed, (center, sword_axes, angle), 255, -1)
+        elif s == "reniform":
+            # Kidney: wide, shallow, concave at base centre
+            pts_poly = _rot_pts([
+                ( 0.0,  -0.65),
+                ( 0.60, -0.90),
+                ( 0.95, -0.20),
+                ( 0.88,  0.55),
+                ( 0.35,  0.90),
+                ( 0.08,  0.60),   # base indentation right
+                ( 0.0,   0.45),   # base centre notch
+                (-0.08,  0.60),
+                (-0.35,  0.90),
+                (-0.88,  0.55),
+                (-0.95, -0.20),
+                (-0.60, -0.90),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "lanceolate":
+            # Lance: widest at ~35% from base, sharp both ends
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),   # pointed apex
+                ( 0.52, -0.10),   # right shoulder (widest)
+                ( 0.28,  1.00),   # base right
+                ( 0.0,   0.75),   # rounded base
+                (-0.28,  1.00),
+                (-0.52, -0.10),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "oblanceolate":
+            # Reversed lance: widest near apex, narrower base
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),   # narrow apex
+                ( 0.50, -0.45),   # right shoulder (widest, near top)
+                ( 0.20,  1.00),   # base right (narrow)
+                ( 0.0,   0.85),
+                (-0.20,  1.00),
+                (-0.50, -0.45),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "oblong":
+            # Rectangular body, parallel sides, rounded ends
+            pts_poly = _rot_pts([
+                (-0.50, -1.00),
+                ( 0.0,  -0.88),
+                ( 0.50, -1.00),
+                ( 0.50,  1.00),
+                ( 0.0,   0.88),
+                (-0.50,  1.00),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "linear":
+            # Very narrow strap, parallel sides, rounded ends
+            pts_poly = _rot_pts([
+                (-0.18, -1.00),
+                ( 0.0,  -0.90),
+                ( 0.18, -1.00),
+                ( 0.18,  1.00),
+                ( 0.0,   0.90),
+                (-0.18,  1.00),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s in ("ensiform", "sword"):
+            # Sword: narrow uniform width, sharp tip
+            pts_poly = _rot_pts([
+                (-0.14, -1.00),
+                ( 0.0,  -0.88),
+                ( 0.14, -1.00),
+                ( 0.10,  0.90),
+                ( 0.0,   1.00),   # sharp tip
+                (-0.10,  0.90),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s in ("cuneate", "wedge"):
+            # Wedge: narrow pointed base, wide flat top
+            pts_poly = _rot_pts([
+                (-0.92, -0.85),
+                ( 0.92, -0.85),
+                ( 0.92, -1.00),
+                (-0.92, -1.00),
+                ( 0.0,   1.00),   # pointed base
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "spathulate":
+            # Spoon: narrow stalk, wide round blade at top
+            # Stalk (lower half)
+            pts_stalk = _rot_pts([
+                (-0.18,  0.10),
+                ( 0.18,  0.10),
+                ( 0.18,  1.00),
+                (-0.18,  1.00),
+            ])
+            cv2.fillPoly(completed, [pts_stalk], 255)
+            # Round blade (upper half)
+            blade_cx = int(round(cx + (-half_maj * 0.35) * np.sin(np.radians(pca_angle))))
+            blade_cy = int(round(cy + (-half_maj * 0.35) * np.cos(np.radians(pca_angle))))
+            cv2.ellipse(completed,
+                        (blade_cx, blade_cy),
+                        (int(half_min * 0.88), int(half_maj * 0.55)),
+                        pca_angle, 0, 360, 255, -1)
+
+        elif s in ("deltoid", "triangular"):
+            # Triangle: wide base, pointed apex
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),   # apex
+                ( 0.95,  1.00),   # base right
+                ( 0.0,   0.70),   # slight base concavity
+                (-0.95,  1.00),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s == "rhomboid":
+            # Diamond: widest at mid-height
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),
+                ( 0.88,  0.0 ),
+                ( 0.0,   1.00),
+                (-0.88,  0.0 ),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s in ("sagittate", "sagittata"):
+            # Arrowhead: pointed apex, basal lobes pointing downward
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),   # apex
+                ( 0.58, -0.30),   # right shoulder
+                ( 0.30,  0.15),   # right waist
+                ( 0.72,  1.00),   # right lobe tip
+                ( 0.20,  0.55),   # right lobe inner
+                ( 0.0,   0.45),   # base notch
+                (-0.20,  0.55),
+                (-0.72,  1.00),
+                (-0.30,  0.15),
+                (-0.58, -0.30),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
+
+        elif s in ("hastate", "alabardata"):
+            # Halberd: pointed apex, basal lobes pointing sideways
+            pts_poly = _rot_pts([
+                ( 0.0,  -1.00),   # apex
+                ( 0.50, -0.35),   # right shoulder
+                ( 0.28,  0.10),   # right waist (pinch)
+                ( 0.95,  0.55),   # right lobe tip (sideways)
+                ( 0.28,  1.00),   # right lobe base
+                ( 0.0,   0.75),   # base centre
+                (-0.28,  1.00),
+                (-0.95,  0.55),
+                (-0.28,  0.10),
+                (-0.50, -0.35),
+            ])
+            cv2.fillPoly(completed, [pts_poly], 255)
 
         else:
-            # Default to ellipse
-            cv2.ellipse(completed, ellipse, 255, -1)
+            # Fallback: plain ellipse
+            cv2.ellipse(completed, center_i, (int(half_min), int(half_maj)),
+                        pca_angle, 0, 360, 255, -1)
 
-        # Convert to bool and ensure original mask is included
-        completed_bool = completed > 127
+        # ── Merge with original mask (never remove existing pixels) ──────────
+        completed_bool = (completed > 127)
         completed_bool = np.logical_or(completed_bool, mask)
-
         return completed_bool
 
     def on_complete_selected_mask(self):
@@ -6259,65 +4703,127 @@ class LeafSegmenterGUI:
         self._draw_rgb_on_canvas(self._unfold_orig_canvas, vis_crop, 250, 250)
 
     def _unfold_update_preview(self):
-        """Update the unfolded preview with current rotation and offset."""
+        """
+        Update the unfolded preview.
+
+        Core concept: a folded leaf is its mirror image across the fold line.
+        We detect the fold line as the junction boundary between the two masks,
+        fit a line through it, then reflect the selected (folded) mask across
+        that line.  The result is placed beside the stationary mask — giving the
+        realistic unfolded appearance.
+
+        The rotation control now fine-tunes the fold-line angle.
+        The offset control lets you shift the mirrored piece.
+        """
         if not self._unfold_masks:
             return
 
-        # Get which mask to rotate
         mask_idx_str = self._unfold_mask_var.get()
         try:
-            rotate_idx = int(mask_idx_str.split("_")[1])
+            fold_idx = int(mask_idx_str.split("_")[1])
         except (IndexError, ValueError):
-            rotate_idx = 0
+            fold_idx = 0
 
-        # Get pivot point
-        pivot = self._get_unfold_pivot(rotate_idx)
-
-        # Create result by rotating the selected mask AND image
         h, w = self._unfold_masks[0]['original'].shape
         result_mask = np.zeros((h, w), dtype=bool)
-        result_img = np.zeros((h, w, 3), dtype=np.uint8)
+        result_img  = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # Get flip state
-        flip_h = getattr(self, '_unfold_flip_h', False)
-        flip_v = getattr(self, '_unfold_flip_v', False)
-
+        fold_mask   = self._unfold_masks[fold_idx]['original']
+        static_mask = np.zeros((h, w), dtype=bool)
         for i, m in enumerate(self._unfold_masks):
-            if i == rotate_idx:
-                # Rotate this mask AND its image
-                rotated_mask = self._rotate_mask(m['original'], self._unfold_rotation_angle, pivot,
-                                                  offset=self._unfold_offset)
-                rotated_img = self._rotate_image(m['img_original'], self._unfold_rotation_angle, pivot,
-                                                  offset=self._unfold_offset)
+            if i != fold_idx:
+                static_mask |= m['original']
 
-                # Apply flip transformations around the pivot point
-                if flip_h or flip_v:
-                    rotated_mask = self._flip_mask(rotated_mask, pivot, flip_h, flip_v)
-                    rotated_img = self._flip_image(rotated_img, pivot, flip_h, flip_v)
+        # ── 1. Find fold line ──────────────────────────────────────────────────
+        # Dilate both masks and find their overlap zone (junction)
+        k = np.ones((7, 7), np.uint8)
+        d_fold   = cv2.dilate(fold_mask.astype(np.uint8),   k, iterations=4)
+        d_static = cv2.dilate(static_mask.astype(np.uint8), k, iterations=4)
+        junction = np.logical_and(d_fold > 0, d_static > 0)
 
-                result_mask |= rotated_mask
-                # Blend images (rotated pixels go on top where mask is True)
-                result_img[rotated_mask] = rotated_img[rotated_mask]
-                m['mask'] = rotated_mask
-                m['img'] = rotated_img
-            else:
-                # Keep original
-                result_mask |= m['original']
+        if junction.any():
+            jys, jxs = np.nonzero(junction)
+            pts = np.stack([jxs, jys], axis=1).astype(np.float32)
+            mu  = pts.mean(axis=0)
+            pts_c = pts - mu
+            _, _, Vt = np.linalg.svd(pts_c, full_matrices=False)
+            fold_dir = Vt[0]   # unit vector along fold line
+        else:
+            # Fallback: use PCA major axis of the folded mask itself
+            fys, fxs = np.nonzero(fold_mask)
+            pts = np.stack([fxs, fys], axis=1).astype(np.float32)
+            mu  = pts.mean(axis=0)
+            pts_c = pts - mu
+            _, _, Vt = np.linalg.svd(pts_c, full_matrices=False)
+            fold_dir = Vt[0]
+            mu = pts.mean(axis=0)
+
+        # ── 2. Apply user rotation tweak to fold line angle ───────────────────
+        extra_rad = np.radians(self._unfold_rotation_angle)
+        cos_e, sin_e = np.cos(extra_rad), np.sin(extra_rad)
+        fold_dir = np.array([
+            fold_dir[0] * cos_e - fold_dir[1] * sin_e,
+            fold_dir[0] * sin_e + fold_dir[1] * cos_e,
+        ])
+        fold_dir /= np.linalg.norm(fold_dir) + 1e-9
+
+        # ── 3. Reflect the folded mask across the fold line ───────────────────
+        pivot = mu.astype(float)          # point on the fold line
+        nx, ny = -fold_dir[1], fold_dir[0]  # normal to fold line
+
+        # Build reflection matrix:  P' = P - 2*(P-pivot)·n̂ * n̂
+        fys2, fxs2 = np.nonzero(fold_mask)
+        if len(fxs2) == 0:
+            return
+
+        coords = np.stack([fxs2.astype(float), fys2.astype(float)], axis=1)
+        diff   = coords - pivot
+        proj   = (diff[:, 0] * nx + diff[:, 1] * ny)[:, None]
+        reflected = coords - 2 * proj * np.array([nx, ny])
+
+        # Apply user offset
+        reflected[:, 0] += self._unfold_offset[0]
+        reflected[:, 1] += self._unfold_offset[1]
+
+        rx = np.clip(np.round(reflected[:, 0]).astype(int), 0, w - 1)
+        ry = np.clip(np.round(reflected[:, 1]).astype(int), 0, h - 1)
+
+        mirrored_mask = np.zeros((h, w), dtype=bool)
+        mirrored_mask[ry, rx] = True
+
+        # Close small gaps from rounding
+        mirrored_mask = cv2.morphologyEx(
+            mirrored_mask.astype(np.uint8),
+            cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+        ).astype(bool)
+
+        # ── 4. Build mirrored image pixels ────────────────────────────────────
+        img_orig = self._unfold_masks[fold_idx]['img_original']
+        src_coords = (fys2, fxs2)
+        dst_ry = np.clip(np.round(reflected[:, 1]).astype(int), 0, h - 1)
+        dst_rx = np.clip(np.round(reflected[:, 0]).astype(int), 0, w - 1)
+        mirrored_img = np.zeros((h, w, 3), dtype=np.uint8)
+        mirrored_img[dst_ry, dst_rx] = img_orig[fys2, fxs2]
+
+        # ── 5. Compose result: static + mirrored ──────────────────────────────
+        result_mask = static_mask | mirrored_mask
+        for i, m in enumerate(self._unfold_masks):
+            if i != fold_idx:
                 result_img[m['original']] = m['img_original'][m['original']]
-                m['mask'] = m['original'].copy()
-                m['img'] = m['img_original'].copy()
+        result_img[mirrored_mask] = mirrored_img[mirrored_mask]
 
-        # Store pending result
+        # Store pending for apply
         self._unfold_pending = {
-            'masks': self._unfold_masks,
-            'result': result_mask,
-            'result_img': result_img,  # Combined image
-            'rotate_idx': rotate_idx,
-            'pivot': pivot,
+            'masks':      self._unfold_masks,
+            'result':     result_mask,
+            'result_img': result_img,
+            'fold_idx':   fold_idx,
+            'fold_dir':   fold_dir,
+            'pivot':      pivot,
+            'mirrored_mask': mirrored_mask,
         }
 
-        # Draw result
-        self._draw_unfold_result(result_mask, rotate_idx)
+        self._draw_unfold_result(result_mask, fold_idx)
 
     def _get_unfold_pivot(self, rotate_idx: int) -> tuple:
         """Get the pivot point for rotation."""
@@ -6569,17 +5075,19 @@ class LeafSegmenterGUI:
         self._unfold_update_preview()
 
     def _unfold_flip_horizontal(self):
-        """Flip the selected mask horizontally."""
-        if not hasattr(self, '_unfold_flip_h'):
-            self._unfold_flip_h = False
-        self._unfold_flip_h = not self._unfold_flip_h
+        """Rotate fold line 90° — changes which axis the mirror reflects across."""
+        self._unfold_rotation_angle = (self._unfold_rotation_angle + 90) % 360
+        if hasattr(self, '_unfold_angle_label'):
+            self._unfold_angle_label.configure(
+                text=f"{self._unfold_rotation_angle:.0f}°")
         self._unfold_update_preview()
 
     def _unfold_flip_vertical(self):
-        """Flip the selected mask vertically."""
-        if not hasattr(self, '_unfold_flip_v'):
-            self._unfold_flip_v = False
-        self._unfold_flip_v = not self._unfold_flip_v
+        """Rotate fold line -90°."""
+        self._unfold_rotation_angle = (self._unfold_rotation_angle - 90) % 360
+        if hasattr(self, '_unfold_angle_label'):
+            self._unfold_angle_label.configure(
+                text=f"{self._unfold_rotation_angle:.0f}°")
         self._unfold_update_preview()
 
     def _unfold_reset_position(self):
@@ -6639,6 +5147,7 @@ class LeafSegmenterGUI:
         self._unfold_update_preview()
 
     def _apply_leaf_unfolding(self):
+        self._push_undo("leaf unfolding")
         """Apply the unfolding - merge masks into one."""
         if not hasattr(self, '_unfold_pending') or self._unfold_pending is None:
             messagebox.showwarning("Leaf Unfolding", "No pending unfold. Click 'Preview Selected' first.")
@@ -7175,6 +5684,7 @@ class LeafSegmenterGUI:
         area = float(mask.sum())
 
         # Update the mask
+        self._push_undo("edit boundary")
         self.sr.masks[self._edit_idx]["segmentation"] = mask
         self.sr.masks[self._edit_idx]["bbox"] = bbox
         self.sr.masks[self._edit_idx]["area"] = area
@@ -7592,6 +6102,7 @@ class LeafSegmenterGUI:
     def clear_all_masks(self):
         if not self.sr:
             return
+        self._push_undo("clear all masks")
         self.sr.masks = []
         self._rebuild_mask_list()
         if self.img_preview is not None:
@@ -7627,6 +6138,7 @@ class LeafSegmenterGUI:
 
         self.set_status(f"Loading {Path(p).name}...", "processing")
         self.img_path = p
+        self._update_file_label()
         arr = ensure_uint8_rgb(Image.open(p))
         self.img_orig = arr                 # keep the unmodified original
         self.img_preview = None
@@ -7838,8 +6350,7 @@ class LeafSegmenterGUI:
         self.batch_idx = i
         p = self.batch_images[i]
         self.img_path = p
-
-        # if we have cached masks, restore them
+        self._update_file_label()
         cached = self._batch_mask_cache.get(p)
         if cached is not None:
             self.sr = cached
@@ -8711,6 +7222,9 @@ class LeafSegmenterGUI:
                     cx1, cy1, cx2, cy2,
                     outline="black", dash=(4, 3), width=2, tags=("pickbox",)
                 )
+
+        # Color filter highlights (drawn on top of everything)
+        color_filter.draw_highlights(self)
 
     
     # ---------- Crop helpers (INSIDE the class) ----------
@@ -10722,7 +9236,13 @@ class LeafSegmenterGUI:
 
 
 
-if __name__ == "__main__":
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main():
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.3)
@@ -10733,6 +9253,8 @@ if __name__ == "__main__":
         style.theme_use("clam")
     except Exception:
         pass
-
     app = LeafSegmenterGUI(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

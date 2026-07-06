@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "source_image": "/Users/nirwantandukar/Documents/Github/Image-Segmentation/ara2012_plant003_rgb.png",
+  "image_png": "ara2012_plant003_rgb.image.png",
+  "segmented_png": "ara2012_plant003_rgb.segmented.png",
+  "rotate_applied": true,
+  "masks": [
+    {
+      "segment_id": "ara2012_plant003_rgb_1",
+      "mask_png": "ara2012_plant003_rgb_1.mask.png",
+      "mask_crop_png": "ara2012_plant003_rgb_1.mask.crop.png",
+      "crop_png": "ara2012_plant003_rgb_1.crop.png",
+      "area_px2": 978,
+      "bbox": [
+        179,
+        82,
+        52,
+        25
+      ]
+    }
+  ]
+}
