@@ -76,7 +76,7 @@ Applications of SAM to plant phenotyping has shown both promise and limitations.
 
 Despite these advances, accessible software for plant-focused, interactive, foundation-model segmentation remains scarce. General annotation platforms such as LabelMe offer manual labelling but lack plant-specific enhancement, mask filtering, phenotypic measurement, and model training workflows \citep{russell2008labelme}. PlantCV is a powerful, widely used image-analysis library for plant phenotyping, but is mainly script-based and thus requires programming expertise for many tasks \citep{gehan2017plantcv}. Meanwhile, many SAM-based plant studies appear as pipelines or experimental frameworks rather than integrated desktop applications that let non-expert users load images, segment plants, edit masks, export traits, and train a lightweight model within a single environment.
 
-We present \textbf{PlantSegmenter}, an interactive, python based GPU-linked desktop application for plant image segmentation and phenotyping with SAM~2. PlantSegmenter is not meant to make segmentation easily accessible in everyday plant biology, especially for users with limited programming skills, few annotations, or no high-performance computing. It combines SAM~2-based segmentation with plant-specific image enhancement, color-based mask filtering, interactive mask editing, several phenotype measurements, geometric leaf completion, folded-leaf reconstruction, and a training workflow that turns curated SAM~2 masks into a lightweight U-Net model. The software is available for download from the GitHub repository at: https://github.com/nirwan1265/Image-Segmentation.
+We present \textbf{LeafSegmenter}, an interactive, Python-based desktop application for plant image segmentation and phenotyping with SAM~2 and lightweight companion models. LeafSegmenter is designed to make plant image analysis accessible in everyday biology workflows, especially for users with limited programming experience, few annotations, or no access to high-performance computing. The software combines SAM~2-based segmentation with plant-specific image enhancement, folder-level batch processing, colour-guided mask filtering, interactive mask editing, geometric and learned leaf completion, folded-leaf reconstruction, phenotype export, and integrated training workflows for lightweight custom models. Segmentation outputs can be saved as reusable mask bundles and reloaded later for further curation or measurement. The software is available at \url{https://github.com/nirwan1265/Image-Segmentation}.
 
 
 
@@ -86,26 +86,16 @@ We present \textbf{PlantSegmenter}, an interactive, python based GPU-linked desk
 
 \subsection{Application Architecture}
 
-PlantSegmenter is implemented in Python~3.11 with a \texttt{tkinter}-based graphical interface. The application is organized as a modular package (\texttt{app}) with seven functional modules:
+LeafSegmenter is implemented in Python~3.11 with a \texttt{tkinter}-based graphical interface. The desktop application is organized as a modular package (\texttt{app/}) that separates interface logic from computational routines. The main GUI state and event handling are implemented in \texttt{gui\_app.py}; \texttt{app\_visuals.py} provides theme and reusable interface components; \texttt{image\_processing.py}, \texttt{mask\_utils.py}, and \texttt{phenotyping.py} contain pure image-processing, mask-geometry, and measurement functions; \texttt{sam2\_utils.py} manages SAM~2 loading and Hydra configuration; \texttt{color\_filter.py} implements interactive colour-based filtering; and \texttt{tab\_leaf\_completion.py}, \texttt{tab\_leaf\_unfolding.py}, and \texttt{tab\_train.py} define specialised workflow panels. Lightweight auxiliary training and inference back ends are invoked from the GUI through companion scripts, including \texttt{tip\_segmenter\_model.py}, \texttt{tip\_segmenter\_trainer.py}, and \texttt{mask\_completion.py}.
 
-\begin{itemize}
-    \item \texttt{gui\_app.py} — main application class, layout, event handling
-    \item \texttt{image\_processing.py} — pure image enhancement functions
-    \item \texttt{mask\_utils.py} — mask mathematics and shape completion geometry
-    \item \texttt{phenotyping.py} — phenotype measurement and CSV export
-    \item \texttt{sam2\_utils.py} — SAM~2 model loading and Hydra configuration
-    \item \texttt{color\_filter.py} — interactive colour-based mask filtering
-    \item \texttt{tab\_leaf\_completion.py}, \texttt{tab\_leaf\_unfolding.py},
-          \texttt{tab\_train.py} — training panel tab modules
-\end{itemize}
+This modular design separates computationally intensive functions from the GUI, allowing independent testing of image enhancement, mask geometry, and phenotype extraction while keeping the desktop workflow interactive.
 
-The modular design separates computationally intensive functions (image enhancement, mask geometry, phenotype measurement) from the GUI, allowing independent use for batch processing and unit testing.
 
 \subsection{Image Loading and Preprocessing}
 
-The application accepts TIFF, PNG, JPEG, and BMP images. A built-in TIF converter converts raw field-acquisition formats to standard 8-bit PNG for segmentation. Images are loaded as RGB \texttt{uint8} NumPy arrays via Pillow and OpenCV python packages.
+The application accepts TIFF, PNG, JPEG, and BMP images. A built-in TIF converter converts raw field-acquisition formats to standard 8-bit PNG for segmentation. Images are loaded as RGB \texttt{uint8} NumPy arrays via Pillow and OpenCV python packages. A rotation module uses a dial widget with preset angles (45°, 90°, 180°, 270°, $-$45°, $-$90°) and arbitrary rotation to orient images acquired at non-standard angles before segmentation.
 
-A rotation module uses a dial widget with preset angles (45°, 90°, 180°, 270°, $-$45°, $-$90°) and arbitrary rotation to orient images acquired at non-standard angles before segmentation.
+In addition to single-image analysis, the application can open whole folders for sequential review and batch segmentation. A preview-coupled crop tool allows users to restrict analysis to a region of interest before segmentation. Previously exported masks can also be restored from JSON or CSV manifests, enabling iterative curation and phenotyping without rerunning model inference.
 
 \subsection{Image Enhancement}
 
@@ -170,7 +160,7 @@ PlantSegmenter integrates SAM~2 \citep{ravi2024sam2} via the official Python API
     \item \texttt{use\_m2m}: mask-to-mask refinement flag.
 \end{itemize}
 
-Hover tooltips in the GUI also explain each parameter. After generation, masks are deduplicated using Intersection-over-Union (IoU $> 0.80$) and split into single-connected-component instances. Batch segmentation processes an entire folder, caching results in memory for later review and export.
+Hover tooltips in the GUI also explain each parameter. After generation, masks are deduplicated using Intersection-over-Union (IoU $> 0.80$) and split into single-connected-component instances. Batch segmentation processes an entire folder, caching results in memory for later review and export. LeafSegmenter accepts either conventional SAM~2 checkpoint--configuration pairs or bundled model files that embed configuration metadata. For folder-level workflows, the application caches per-image segmentation results in memory so users can review images one by one and later export all masks in a single batch-saving step.
 
 \subsection{Mask Editing Tools}
 
@@ -228,6 +218,12 @@ three sequential alignment steps:
 
 The aligned template is rasterised at full resolution and merged with the original mask (preserving all pixels). Fine interactive adjustments to scale, position, and rotation are available before committing the final mask.
 
+
+\subsubsection{Learned Mask Completion}
+
+In addition to template-based completion, LeafSegmenter supports a learned mask-to-mask completion model. This model takes a cropped partial binary mask as input and predicts a completed binary mask without using RGB information. Training uses complete leaf masks as ground truth and synthesizes partial masks on the fly using three occlusion strategies: edge truncation, random geometric occluders, and leaf-on-leaf overlays sampled from other masks in the training set. Random flips, rotations, aspect-ratio perturbations, and scale changes are used as augmentation. The completion network is a compact one-channel U-Net trained with a combined binary cross-entropy plus Dice loss, AdamW optimisation, gradient clipping, and cosine-annealed learning rate. During inference, the selected mask is cropped to its bounding box with padding, completed in crop coordinates, mapped back to full-image coordinates, and restricted to connected components that touch the original mask.
+
+
 \subsection{Leaf Unfolding Reconstruction}
 \label{sec:unfolding}
 
@@ -261,7 +257,7 @@ computed and exported as CSV files:
     \item \textbf{Connected components}: number of distinct blobs
 \end{itemize}
 
-\subsubsection{Colour Descriptors}
+\subsubsection{Color Descriptors}
 \begin{itemize}
     \item Per-channel (R, G, B, H, S, V) mean, median, sum, and standard
           deviation within the mask
@@ -269,37 +265,88 @@ computed and exported as CSV files:
     \item Vegetation index means: ExG, ExR, ExGR, GLI, green pixel fraction
 \end{itemize}
 
-Both \textit{individual} (per-segment) and \textit{joint} (aggregated across
-a selection) CSV exports are supported.  Masks may also be saved as full-size
-binary PNG files, bounding-box-cropped binary masks, and RGBA transparent-background
-crops.
+Both \textit{individual} (per-segment) and \textit{joint} (aggregated) CSV exports are supported. Masks can be saved as full-size binary PNGs, bounding-box-cropped binary masks, or RGBA transparent-background crops. A combined export also writes JSON or CSV manifests linking masks to the source image and segmentation preview, enabling later reloading for editing or measurement. For geometrically extended masks, geometric descriptors use the completed mask, while colour-based statistics use only observed pixels, excluding synthetic extensions when possible.
 
 \subsection{Custom Model Training}
 \label{sec:training}
 
-To enable rapid, class-specific segmentation without SAM~2 at inference time,
-PlantSegmenter includes an integrated training pipeline.
+To enable fast class-specific segmentation without SAM~2 at inference, LeafSegmenter includes a workflow for training lightweight binary segmentation models from curated masks.
 
 \subsubsection{Data Collection}
 
-Users gather training examples during normal SAM~2-assisted segmentation: after segmenting an image, selected masks are added to a structured dataset (images in \texttt{images/}, binary masks in \texttt{masks/}) with one button press. Images can also be labeled as negative examples (no target present).
+Users collect training examples during routine curation. Selected masks are exported to a structured dataset with images in \texttt{images/} and binary instance masks in \texttt{masks/}. Multiple instance masks for the same image are merged during training into a single target mask. Images without the target class can be marked with \texttt{\_nomask.txt} and used as negative examples.
 
 \subsubsection{Model Architecture}
 
-The default architecture is a U-Net \citep{ronneberger2015unet} with a ResNet-18 \citep{he2016deep} encoder pre-trained on ImageNet \citep{deng2009imagenet}, implemented using \texttt{segmentation-models-pytorch} \citep{yakubovskiy2019smp}. A lightweight variant (\texttt{unet\_small}) omits the pre-trained encoder for resource-constrained settings. The binary decoder outputs a single-channel mask.
+The GUI exposes two binary segmentation architectures: a compact custom U-Net (\texttt{unet\_small}) and a U-Net-style decoder with a ResNet-18 encoder (\texttt{unet\_resnet18}), optionally pretrained on ImageNet. Both output a single-channel probability map, which is thresholded to produce a binary mask.
 
 \subsubsection{Training Procedure}
 
-Training uses the Adam optimiser \citep{kingma2014adam} with configurable learning rate (default $10^{-5}$), batch size, image size, device, and gradient steps. A weighted binary cross-entropy loss addresses foreground–background class imbalance. Training can be resumed from a checkpoint, and all hyperparameters are configurable via the GUI without code changes.
+Training images and masks are letterboxed to a fixed square size with preserved aspect ratio. The pipeline applies lightweight augmentation (horizontal/vertical flips and mild brightness–contrast jitter). Foreground imbalance is addressed via a positive-class weight estimated from the curated dataset and a loss combining weighted binary cross-entropy with Dice. Optimisation uses AdamW with configurable learning rate, batch size, device, input size, and training steps, with optional checkpoint resume. Training progress is streamed to the GUI log in real time.
 
 \subsubsection{Inference}
 
-The trained model accepts arbitrary-resolution images, runs the same enhancement pipeline as SAM~2 segmentation, and generates instance masks via connected-component analysis on a thresholded probability map. A sliding-window inference mode processes large images using overlapping tiles and merges predictions, while an optional colour-guided mode restricts tiles to plant-coloured regions to substantially reduce inference time on large field images.
+At inference, the trained model processes arbitrary-resolution RGB images using the same letterbox/unletterbox strategy. The probability map is thresholded and post-processed by connected-component analysis, minimum-area filtering, and optional retention of only the largest component. For large images, a sliding-window mode runs the model on overlapping tiles and merges the outputs. Optional HSV-guided tile screening can skip clearly irrelevant regions, and additional post-filters can suppress white background pixels or remove green tissue, depending on the target class.
 
 %%──────────────────────────────────────────────────────────────────────────────
+
 \section*{Results}
 
-[Your acknowledgements here.]
+We present qualitative results illustrating the main LeafSegmenter workflows as follows: SAM~2-based segmentation, image enhancement, interactive mask editing, leaf completion, and lightweight custom-model training.
+
+\subsection*{SAM~2 Parameters Define Mask Density and Boundary Delineation}
+
+Segmentation output depended strongly on SAM~2 mask-generation settings, particularly \texttt{points\_per\_side} and \texttt{pred\_iou\_thresh} (Fig.~\ref{fig:sam2_params}). With \texttt{pred\_iou\_thresh} fixed at 0.8, increasing \texttt{points\_per\_side} from 8 to 32 yielded more detected masks and finer subdivision of plant and background regions (Fig.~\ref{fig:sam2_params}A,B). With \texttt{points\_per\_side} fixed at 32, reducing \texttt{pred\_iou\_thresh} from 0.8 to 0.2 retained additional masks, including smaller and lower-confidence regions (Fig.~\ref{fig:sam2_params}B,C). Thus, lower sampling density and stricter IoU filtering produced fewer, more conservative masks, whereas denser sampling and lower IoU thresholds yielded more exhaustive but noisier segments. LeafSegmenter can therefore be tuned for either cleaner mask selection or maximal segment recovery, depending on the image and downstream objective.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/Fig1.png}
+    \caption{Effect of SAM~2 mask-generation parameters on segmentation output. (A) \texttt{points\_per\_side = 8} and \texttt{pred\_iou\_thresh = 0.8} produced the fewest masks and the most conservative segmentation. (B) Increasing \texttt{points\_per\_side} to 32 while keeping \texttt{pred\_iou\_thresh = 0.8} increased mask density and further subdivided adjacent regions. (C) Keeping \texttt{points\_per\_side = 32} but lowering \texttt{pred\_iou\_thresh} to 0.2 retained the greatest number of candidate masks, including smaller and lower-confidence regions.}
+    \label{fig:sam2_params}
+\end{figure}
+
+
+\subsection*{Image Enhancement Improves Leaf Contrast and Segmentation Readiness}
+
+Image enhancement altered contrast, colour balance, and edge visibility in ways that can simplify segmentation, depending on the input image (Fig.~\ref{fig:image_enhancement}). The original image is shown in Fig.~\ref{fig:image_enhancement}A, with representative outputs including green-aware enhancement (B), edge darkening (C), Retinex-based illumination correction (D), ExG vegetation-index enhancement (E), and LAB-based enhancement (F). Each mode emphasizes different features: some highlight leaf boundaries, others increase contrast between green tissue and background, and others correct uneven lighting or colour imbalance. Instead of a single fixed preprocessing method, LeafSegmenter lets users choose the enhancement strategy that best improves plant visibility for each scene, enabling more effective segmentation.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/Fig2.png}
+    \caption{Representative image-enhancement modes available in LeafSegmenter. (A) Original image without enhancement. (B) Green-aware enhancement. (C) Edge darkening. (D) Retinex-based illumination correction. (E) ExG vegetation-index enhancement. (F) LAB-based enhancement. Different enhancement modes emphasize different visual properties of the image and can be selected according to the lighting conditions, background complexity, and segmentation goal.}
+    \label{fig:image_enhancement}
+\end{figure}
+
+\subsection*{Interactive Boundary Editing Improves Local Mask Accuracy}
+
+Automatic segmentation can be refined using LeafSegmenter’s interactive mask-editing tools (Fig.~\ref{fig:mask_editing}). In the example, the auricle region of a maize leaf was identified and then corrected by directly editing the mask boundary: control points were dragged to better follow tissue margins and extend the segment toward the stem, yielding a more complete, biologically accurate mask (Fig.~\ref{fig:mask_editing}A--C). This user-guided boundary adjustment corrects local under-segmentation or shape mismatch without rerunning the full workflow and is especially useful when automatic masks only partially capture the target structure or miss fine morphological boundaries.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/Fig3.png}
+    \caption{Example of interactive mask-boundary editing in LeafSegmenter. (A) Initial segmentation view showing the selected maize auricle region. (B) Boundary-editing interface, where control points are manually adjusted to better follow the visible auricle margin and extend the mask toward the stem. (C) Final refined segmentation after boundary correction. This workflow enables local improvement of imperfect automatic masks without rerunning the full segmentation procedure.}
+    \label{fig:mask_editing}
+\end{figure}
+
+
+\subsection*{Leaf Completion Restores Plausible Leaf Shape for Area Estimation}
+
+Leaf completion reconstructs a more complete leaf outline when a target leaf is occluded or only partly segmented (Fig.~\ref{fig:leaf_completion}). In the Arabidopsis example, default segmentation detected a partially visible rosette leaf, which was then selected by its bounding box for completion (Fig.~\ref{fig:leaf_completion}A). A geometric template from the built-in leaf-shape gallery was aligned to the visible mask and used to generate a completed outline (Fig.~\ref{fig:leaf_completion}B,C). When mapped back to the full segmented image, the completed mask yielded a fuller, more biologically plausible leaf shape (Fig.~\ref{fig:leaf_completion}D). This workflow mitigates underestimation of leaf area due to overlap or partial visibility, enabling morphometric measurements that better approximate true leaf dimensions.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/Fig4.png}
+    \caption{Example of geometric leaf completion in LeafSegmenter. (A) Default segmentation of an Arabidopsis rosette, with the partially occluded leaf selected for completion. (B) Selection of a geometric leaf template from the built-in shape gallery. (C) Completed mask generated from the aligned template. (D) Final completed leaf overlaid in the full segmented image. This workflow allows partially visible leaves to be reconstructed so that downstream area and shape measurements more closely reflect the true leaf morphology.}
+    \label{fig:leaf_completion}
+\end{figure}
+
+
+\subsection*{V. Custom Model Training}
+
+A lightweight custom model was trained for stress phenotyping in young maize leaves, targeting white or grey cold-stress tips (Fig.~XE). Target regions were first segmented and curated in the interactive workflow, and these masks were used to train a binary segmentation model. The trained model focused on stress-tip regions rather than general leaf tissue, enabling task-specific segmentation of cold-stress symptoms. This shows how curated SAM~2-assisted annotations can be distilled into a smaller model for rapid, specialised inference on new images.
+
+
+
 
 %%──────────────────────────────────────────────────────────────────────────────
 \bibliographystyle{abbrvnat}
