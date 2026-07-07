@@ -341,10 +341,16 @@ Leaf completion reconstructs a more complete leaf outline when a target leaf is 
 \end{figure}
 
 
-\subsection*{V. Custom Model Training}
+\subsection*{Custom U-Net Training Enables Stress-Specific Tip Segmentation}
 
-A lightweight custom model was trained for stress phenotyping in young maize leaves, targeting white or grey cold-stress tips (Fig.~XE). Target regions were first segmented and curated in the interactive workflow, and these masks were used to train a binary segmentation model. The trained model focused on stress-tip regions rather than general leaf tissue, enabling task-specific segmentation of cold-stress symptoms. This shows how curated SAM~2-assisted annotations can be distilled into a smaller model for rapid, specialised inference on new images.
+LeafSegmenter enabled training of a lightweight custom segmentation model for a specific stress-phenotyping task in young maize leaves (Fig.~\ref{fig:custom_model}). Cold-stressed leaves with white to yellowish tip tissue were first identified and segmented using the interactive SAM~2-assisted workflow (Fig.~\ref{fig:custom_model}A). The curated tip masks then served as training targets for a custom U-Net model with encoder-based feature extraction (Fig.~\ref{fig:custom_model}B). After training, the model segmented stress-damaged tip tissue in new images while ignoring healthy leaf blade tissue (Fig.~\ref{fig:custom_model}C), showing how LeafSegmenter-derived masks can be converted into a smaller, task-specific model for rapid, specialised inference.
 
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/Fig5.png}
+    \caption{Example of custom-model training for stress-specific segmentation in LeafSegmenter. (A) Young maize leaves showing white to yellowish cold-stress tip symptoms used as source images. (B) Stress-tip regions segmented and curated as training targets. (C) Example of inference on a new image using the trained custom model, which segments the cold-stress tip region while excluding the remaining healthy leaf tissue.}
+    \label{fig:custom_model}
+\end{figure}
 
 
 
